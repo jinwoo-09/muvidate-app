@@ -74,20 +74,20 @@ export function UsernameSetupModal() {
   const initials = username.trim() ? username.trim().slice(0, 2).toUpperCase() : "MD";
 
   return (
-    <div className="fixed inset-0 z-[20000] flex items-center justify-center p-4 bg-black/85 backdrop-blur-md overflow-y-auto">
-      <div className="w-full max-w-md max-h-[90dvh] overflow-y-auto bg-neutral-900 border border-neutral-800 rounded-3xl shadow-2xl p-6 sm:p-8 relative my-auto">
+    <div className="fixed inset-0 z-[20000] flex items-center justify-center p-3 sm:p-4 bg-black/92 overflow-y-auto w-full h-full">
+      <div className="w-full max-w-md max-h-[85dvh] overflow-y-auto bg-neutral-900 border border-neutral-800 rounded-3xl shadow-2xl p-5 sm:p-7 relative my-auto no-scrollbar">
         {/* Ambient glow accent */}
         <div className="absolute -top-20 -right-20 w-44 h-44 bg-rose-500/15 rounded-full blur-3xl pointer-events-none" />
         <div className="absolute -bottom-20 -left-20 w-44 h-44 bg-amber-500/10 rounded-full blur-3xl pointer-events-none" />
 
-        <div className="text-center mb-6">
-          <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-gradient-to-tr from-rose-600 to-amber-500 text-white shadow-lg shadow-rose-500/20 mb-3">
-            <Film className="w-7 h-7" />
+        <div className="text-center mb-5">
+          <div className="inline-flex items-center justify-center w-12 h-12 rounded-2xl bg-gradient-to-tr from-rose-600 to-amber-500 text-white shadow-lg shadow-rose-500/20 mb-2.5">
+            <Film className="w-6 h-6" />
           </div>
-          <h2 className="text-2xl font-bold font-heading text-white tracking-tight">
+          <h2 className="text-xl sm:text-2xl font-bold font-heading text-white tracking-tight">
             {mode === "register" ? "Welcome to MuviDate" : "Welcome Back"}
           </h2>
-          <p className="text-neutral-400 text-sm mt-1">
+          <p className="text-neutral-400 text-xs sm:text-sm mt-1">
             {mode === "register"
               ? "Create your username and password to sync with friends anywhere."
               : "Log in with your existing username and password."}
@@ -95,7 +95,7 @@ export function UsernameSetupModal() {
         </div>
 
         {/* Tab switch */}
-        <div className="flex p-1 bg-neutral-950 border border-neutral-800 rounded-xl mb-5">
+        <div className="flex p-1 bg-neutral-950 border border-neutral-800 rounded-xl mb-4">
           <button
             type="button"
             onClick={() => {
@@ -128,23 +128,29 @@ export function UsernameSetupModal() {
           </button>
         </div>
 
-        {/* Avatar Preview */}
-        {mode === "register" && (
-          <div className="flex justify-center mb-5">
-            <div className="relative">
-              <div className="w-16 h-16 rounded-full bg-gradient-to-br from-neutral-800 to-neutral-700 border-2 border-neutral-600 flex items-center justify-center text-rose-400 font-bold text-lg shadow-inner">
+        {/* Avatar Preview with fixed height container to prevent layout jumping */}
+        <div className="h-16 mb-4 flex justify-center items-center">
+          {mode === "register" ? (
+            <div className="relative animate-in fade-in duration-200">
+              <div className="w-14 h-14 rounded-full bg-gradient-to-br from-neutral-800 to-neutral-700 border-2 border-neutral-600 flex items-center justify-center text-rose-400 font-bold text-base shadow-inner">
                 {initials}
               </div>
-              <div className="absolute bottom-0 right-0 w-5 h-5 rounded-full bg-rose-600 text-white flex items-center justify-center border-2 border-neutral-900 shadow">
-                <User className="w-3 h-3" />
+              <div className="absolute bottom-0 right-0 w-4 h-4 rounded-full bg-rose-600 text-white flex items-center justify-center border-2 border-neutral-900 shadow">
+                <User className="w-2.5 h-2.5" />
               </div>
             </div>
-          </div>
-        )}
+          ) : (
+            <div className="relative animate-in fade-in duration-200">
+              <div className="w-14 h-14 rounded-full bg-gradient-to-br from-neutral-800 to-neutral-700 border-2 border-neutral-600 flex items-center justify-center text-rose-400 font-bold text-base shadow-inner">
+                <LogIn className="w-6 h-6 text-rose-400" />
+              </div>
+            </div>
+          )}
+        </div>
 
-        <form onSubmit={handleSubmit} className="space-y-4">
+        <form onSubmit={handleSubmit} className="space-y-3.5">
           <div>
-            <label className="block text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1.5">
+            <label className="block text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1">
               Username
             </label>
             <div className="relative">
@@ -169,7 +175,7 @@ export function UsernameSetupModal() {
           </div>
 
           <div>
-            <label className="block text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1.5">
+            <label className="block text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1">
               Password
             </label>
             <div className="relative">
@@ -195,7 +201,7 @@ export function UsernameSetupModal() {
 
           {mode === "register" && (
             <div>
-              <label className="block text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1.5">
+              <label className="block text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1">
                 Confirm Password
               </label>
               <div className="relative">
@@ -214,7 +220,7 @@ export function UsernameSetupModal() {
           )}
 
           {error && (
-            <div className="flex items-start gap-2 p-3 bg-rose-500/10 border border-rose-500/30 rounded-xl text-rose-300 text-xs">
+            <div className="flex items-start gap-2 p-2.5 bg-rose-500/10 border border-rose-500/30 rounded-xl text-rose-300 text-xs">
               <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
               <span>{error}</span>
             </div>

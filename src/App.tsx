@@ -455,7 +455,7 @@ function MainContent() {
   // If user is inside an active watch room, show the WatchRoom view
   if (activeRoomCode) {
     return (
-      <div className="min-h-dvh w-full overflow-x-clip bg-neutral-950 text-neutral-100 flex flex-col selection:bg-rose-500 selection:text-white app-root-container app-safe-shell">
+      <div className="min-h-screen w-full overflow-x-hidden bg-neutral-950 text-neutral-100 flex flex-col selection:bg-rose-500 selection:text-white app-root-container app-safe-shell">
         <div
           className="native-status-bar-shield fixed top-0 inset-x-0 z-[19500] bg-neutral-950/90 backdrop-blur-md pointer-events-none"
           aria-hidden="true"
@@ -510,7 +510,7 @@ function MainContent() {
   }
 
   return (
-    <div className="min-h-dvh w-full overflow-x-clip bg-neutral-950 text-neutral-100 flex flex-col selection:bg-rose-500 selection:text-white app-root-container app-safe-shell">
+    <div className="min-h-screen w-full overflow-x-hidden bg-neutral-950 text-neutral-100 flex flex-col selection:bg-rose-500 selection:text-white app-root-container app-safe-shell">
       <div
         className="native-status-bar-shield fixed top-0 inset-x-0 z-[19500] bg-neutral-950/90 backdrop-blur-md pointer-events-none"
         aria-hidden="true"

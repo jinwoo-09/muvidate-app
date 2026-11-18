@@ -34,7 +34,7 @@ export function Navbar({
   const initials = profile?.username ? profile.username.slice(0, 2).toUpperCase() : "MD";
 
   return (
-    <header className="sticky sticky-safe-top z-40 w-full bg-neutral-950/85 backdrop-blur-xl border-b border-neutral-800/80 transition-all">
+    <header className="sticky sticky-safe-top z-40 w-full bg-neutral-950/98 border-b border-neutral-800/80 transition-all">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
         {/* Logo */}
         <div className="flex items-center gap-6">
