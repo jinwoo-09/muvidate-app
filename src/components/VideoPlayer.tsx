@@ -1,0 +1,2468 @@
+import React, { useState, useRef, useEffect, useCallback } from "react";
+import { 
+  Play, 
+  Pause, 
+  RotateCcw, 
+  RotateCw, 
+  Volume2, 
+  VolumeX, 
+  Maximize, 
+  Minimize, 
+  Lock, 
+  Check, 
+  Radio, 
+  Loader2, 
+  AlertCircle,
+  Headphones,
+  Crop,
+  Film,
+  Layers,
+  ChevronDown,
+  Subtitles,
+  Settings
+} from "lucide-react";
+import Hls from "hls.js";
+import { rtdb } from "../lib/firebase";
+import {
+  getApiBaseUrl,
+  setKeepScreenOn,
+  enterNativeFullscreen,
+  exitNativeFullscreen,
+  isNativeApp
+} from "../lib/nativeBridge";
+import { ref, onChildAdded, off, get } from "firebase/database";
+import { SeriesStructure, extractSeriesStructure, getEpisodeUrl, getSubtitleForEpisode, convertSrtToVtt } from "../lib/seriesUtils";
+import { 
+  isHlsUrl, 
+  isHlsJsSupported, 
+  isNativeHlsSupported, 
+  formatQualityLevels, 
+  sanitizeMediaUrl, 
+  HlsQualityOption 
+} from "../lib/hlsUtils";
+
+/**
+ * Detects Apple WebKit browsers including iOS Safari, Chrome on iOS (CriOS),
+ * Firefox on iOS (FxiOS), and iPadOS Safari.
+ */
+export function isAppleWebKitDevice(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent || "";
+  const platform = (navigator as any).userAgentData?.platform || navigator.platform || "";
+  const isIOS = /iPad|iPhone|iPod/.test(ua) || (platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const isWebKit = /WebKit/i.test(ua) && !/Chrome|Android/i.test(ua);
+  return isIOS || isWebKit;
+}
+
+export interface VideoPlayerProps {
+  src: string;
+  poster?: string;
+  isHost: boolean;
+  controlsLocked: boolean;
+  syncState?: {
+    isPlaying: boolean;
+    currentTime: number;
+    lastUpdated: number;
+    updatedBy: string;
+    audioTrackIndex?: number;
+  };
+  onPlaybackChange?: (state: { isPlaying: boolean; currentTime: number }) => void;
+  onAudioTrackChange?: (index: number) => void;
+  onVideoEnded?: () => void;
+  roomCode?: string;
+  currentUserId?: string;
+  seriesStructure?: SeriesStructure;
+  currentSeason?: number;
+  currentEpisode?: number;
+  onSelectEpisode?: (seasonNum: number, episodeNum: number, episodeUrl: string) => void;
+  subtitle?: string;
+}
+
+function VideoPlayerComponent({
+  src,
+  poster,
+  isHost,
+  controlsLocked,
+  syncState,
+  onPlaybackChange,
+  onAudioTrackChange,
+  onVideoEnded,
+  roomCode,
+  currentUserId,
+  seriesStructure: propSeriesStructure,
+  currentSeason: propCurrentSeason,
+  currentEpisode: propCurrentEpisode,
+  onSelectEpisode,
+  subtitle
+}: VideoPlayerProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [bufferedEnd, setBufferedEnd] = useState(0);
+  const [volume, setVolume] = useState(1);
+  const [isMuted, setIsMuted] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  const [isBuffering, setIsBuffering] = useState(false);
+  const [playbackError, setPlaybackError] = useState<string | null>(null);
+  const [showControls, setShowControls] = useState(true);
+  const [showAudioMenu, setShowAudioMenu] = useState(false);
+  const [showDisplayMenu, setShowDisplayMenu] = useState(false);
+  const [displayMode, setDisplayMode] = useState<"fit" | "zoom" | "stretch">("fit");
+  const [isSubtitlesEnabled, setIsSubtitlesEnabled] = useState(true);
+  const [hasCurrentSubtitle, setHasCurrentSubtitle] = useState(false);
+  const isSubtitlesEnabledRef = useRef(true);
+  const activeBlobUrlRef = useRef<string | null>(null);
+  const subtitleRequestIdRef = useRef<number>(0);
+
+  useEffect(() => {
+    isSubtitlesEnabledRef.current = isSubtitlesEnabled;
+  }, [isSubtitlesEnabled]);
+
+  // HLS Quality and playback engine states
+  const [showQualityMenu, setShowQualityMenu] = useState(false);
+  const [availableQualities, setAvailableQualities] = useState<HlsQualityOption[]>([]);
+  const [selectedQuality, setSelectedQuality] = useState<number>(-1); // -1 is Auto
+  const [currentQualityHeight, setCurrentQualityHeight] = useState<number | null>(null);
+
+  const hlsRef = useRef<Hls | null>(null);
+  const networkRetryCountRef = useRef(0);
+  const mediaRetryCountRef = useRef(0);
+
+  useEffect(() => {
+    const handleGlobalClick = () => {
+      setShowAudioMenu(false);
+      setShowDisplayMenu(false);
+      setShowQualityMenu(false);
+    };
+    window.addEventListener("click", handleGlobalClick);
+    return () => {
+      window.removeEventListener("click", handleGlobalClick);
+    };
+  }, []);
+
+  // Fullscreen chat message overlay
+  const [fullscreenChatOverlay, setFullscreenChatOverlay] = useState<{
+    id: string;
+    username: string;
+    text: string;
+  } | null>(null);
+  const overlayTimerRef = useRef<number | null>(null);
+  const fullscreenEnteredAtRef = useRef<number>(Infinity);
+  const isFullscreenRef = useRef<boolean>(false);
+
+  // Audio track support detection
+  const [availableAudioTracks, setAvailableAudioTracks] = useState<any[]>([]);
+  const [currentAudioTrack, setCurrentAudioTrack] = useState(0);
+
+  // Auto-hiding Real-time Sync Indicator state
+  const [showSyncIndicator, setShowSyncIndicator] = useState(false);
+  const syncIndicatorTimerRef = useRef<number | null>(null);
+
+  const triggerSyncIndicator = useCallback(() => {
+    setShowSyncIndicator(true);
+    if (syncIndicatorTimerRef.current) {
+      clearTimeout(syncIndicatorTimerRef.current);
+    }
+    syncIndicatorTimerRef.current = window.setTimeout(() => {
+      setShowSyncIndicator(false);
+      syncIndicatorTimerRef.current = null;
+    }, 2000);
+  }, []);
+
+  // Cleanup sync indicator timer on unmount
+  useEffect(() => {
+    return () => {
+      if (syncIndicatorTimerRef.current) {
+        clearTimeout(syncIndicatorTimerRef.current);
+      }
+    };
+  }, []);
+
+  const controlsTimeoutRef = useRef<number | null>(null);
+  const isSeekingRef = useRef(false);
+  const isApplyingRemoteSyncRef = useRef(false);
+  const isUserIntentionalActionRef = useRef(false);
+  const hasSystemInterruptionRef = useRef(false);
+
+  const lastEmittedState = useRef<{ isPlaying: boolean; currentTime: number } | null>(null);
+  const lastSyncProcessedRef = useRef<{
+    lastUpdated: number;
+    isPlaying: boolean;
+    currentTime: number;
+    audioTrackIndex?: number;
+  } | null>(null);
+
+  const syncStateRef = useRef(syncState);
+  syncStateRef.current = syncState;
+  const hasInitialSyncAppliedRef = useRef(false);
+
+  const onVideoEndedRef = useRef(onVideoEnded);
+  onVideoEndedRef.current = onVideoEnded;
+
+  const canControl = isHost || !controlsLocked;
+
+  // Series / Season / Episode detection & state
+  const effectiveSeries = React.useMemo(() => {
+    if (propSeriesStructure) return propSeriesStructure;
+    return extractSeriesStructure(src);
+  }, [propSeriesStructure, src]);
+
+  const [localSeason, setLocalSeason] = useState(1);
+  const [localEpisode, setLocalEpisode] = useState(1);
+  const [isSeasonMenuOpen, setIsSeasonMenuOpen] = useState(false);
+  const [isEpisodeMenuOpen, setIsEpisodeMenuOpen] = useState(false);
+  const seasonMenuRef = useRef<HTMLDivElement>(null);
+  const episodeMenuRef = useRef<HTMLDivElement>(null);
+
+  const selectedSeasonNum = propCurrentSeason !== undefined ? propCurrentSeason : localSeason;
+  const selectedEpisodeNum = propCurrentEpisode !== undefined ? propCurrentEpisode : localEpisode;
+
+  const currentSeasonData = effectiveSeries.seasons.find(
+    (s) => s.seasonNumber === selectedSeasonNum
+  ) || effectiveSeries.seasons[0];
+
+  const currentSeasonEpisodes = currentSeasonData ? currentSeasonData.episodes : [];
+
+  // Resolve effective media source URL (handling room episodes or solo series episode switches)
+  const effectiveMediaSrc = React.useMemo(() => {
+    if (onSelectEpisode) {
+      return src;
+    }
+    if (effectiveSeries.isSeries) {
+      const s = effectiveSeries.seasons.find((sn) => sn.seasonNumber === selectedSeasonNum);
+      const ep = s?.episodes.find((e) => e.episodeNumber === selectedEpisodeNum);
+      if (ep && ep.url) return ep.url;
+    }
+    return src;
+  }, [onSelectEpisode, src, effectiveSeries, selectedSeasonNum, selectedEpisodeNum]);
+
+  // Single-shot buffering recovery state tracking
+  const wasBufferingRef = useRef(false);
+  const isRecoveringFromBufferRef = useRef(false);
+  const currentMediaKeyRef = useRef(`${roomCode || ""}:${effectiveMediaSrc}`);
+
+  useEffect(() => {
+    currentMediaKeyRef.current = `${roomCode || ""}:${effectiveMediaSrc}`;
+    wasBufferingRef.current = false;
+    isRecoveringFromBufferRef.current = false;
+    hasInitialSyncAppliedRef.current = false;
+  }, [roomCode, effectiveMediaSrc]);
+
+  // Apple iOS / Safari MP4 Codec & Black Screen Diagnostic states
+  const [codecDiagnostic, setCodecDiagnostic] = useState<{
+    isHev1: boolean;
+    title: string;
+    summary: string;
+    audioPlaying: boolean;
+    details?: string;
+    recommendation: string;
+  } | null>(null);
+  const [isDiagnosticDismissed, setIsDiagnosticDismissed] = useState(false);
+  const hasProbedCodecRef = useRef(false);
+
+  // Reset codec diagnosis state on media switch
+  useEffect(() => {
+    hasProbedCodecRef.current = false;
+    setCodecDiagnostic(null);
+    setIsDiagnosticDismissed(false);
+  }, [effectiveMediaSrc]);
+
+  // Ensure native video element has playsinline and webkit-playsinline DOM attributes
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.setAttribute("playsinline", "true");
+    video.setAttribute("webkit-playsinline", "true");
+    video.setAttribute("x5-playsinline", "true");
+  }, []);
+
+  const runCodecDiagnosis = useCallback(async (isAudioCurrentlyPlaying: boolean) => {
+    if (hasProbedCodecRef.current) return;
+    hasProbedCodecRef.current = true;
+
+    try {
+      const apiBase = getApiBaseUrl();
+      const res = await fetch(`${apiBase}/api/diagnose-media?url=${encodeURIComponent(effectiveMediaSrc)}`);
+      if (!res.ok) throw new Error("Diagnosis endpoint error");
+      const data = await res.json();
+
+      if (data.detectedCodecTag === "hev1" || !data.appleCompatibility?.isCompatible) {
+        setCodecDiagnostic({
+          isHev1: data.detectedCodecTag === "hev1",
+          title: isAudioCurrentlyPlaying
+            ? "Apple iOS Black Screen (HEVC 'hev1' Incompatibility)"
+            : "Apple iOS Codec Incompatibility (HEVC 'hev1')",
+          summary:
+            data.appleCompatibility?.reason ||
+            "This MP4 video is encoded in HEVC (H.265) with the 'hev1' tag. Apple AVFoundation strictly requires the 'hvc1' tag or H.264 (AVC) to decode video frames.",
+          audioPlaying: isAudioCurrentlyPlaying,
+          details:
+            "Android Chrome, desktop Chrome, and VLC can decode both 'hev1' and 'hvc1'. However, Apple devices lack hardware decoding for 'hev1' MP4 files.",
+          recommendation:
+            data.appleCompatibility?.recommendation ||
+            "Please use an H.264 (avc1) encoded MP4 or an HLS (.m3u8) stream for universal playback on iPhone and iPad."
+        });
+      }
+    } catch {
+      // Local fallback diagnosis if server probe is unreachable
+      if (isAppleWebKitDevice() && !isHlsUrl(effectiveMediaSrc) && effectiveMediaSrc.includes(".mp4")) {
+        setCodecDiagnostic({
+          isHev1: true,
+          title: isAudioCurrentlyPlaying
+            ? "Apple iOS Black Screen (HEVC 'hev1' Incompatibility)"
+            : "Apple iOS Codec Incompatibility",
+          summary:
+            "This MP4 video is encoded in HEVC (H.265) with the 'hev1' tag. Apple AVFoundation strictly requires the 'hvc1' tag or H.264 (AVC) to decode video frames.",
+          audioPlaying: isAudioCurrentlyPlaying,
+          details:
+            "Android Chrome, desktop Chrome, and VLC can decode both 'hev1' and 'hvc1'. However, Apple devices lack hardware decoding for 'hev1' MP4 files.",
+          recommendation:
+            "Please use an H.264 (avc1) encoded MP4 or an HLS (.m3u8) stream for universal playback on iPhone and iPad."
+        });
+      }
+    }
+  }, [effectiveMediaSrc]);
+
+  // Close menus when clicking outside
+  useEffect(() => {
+    const handleOutsideClick = (e: MouseEvent) => {
+      if (
+        seasonMenuRef.current &&
+        !seasonMenuRef.current.contains(e.target as Node)
+      ) {
+        setIsSeasonMenuOpen(false);
+      }
+      if (
+        episodeMenuRef.current &&
+        !episodeMenuRef.current.contains(e.target as Node)
+      ) {
+        setIsEpisodeMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleOutsideClick);
+    return () => document.removeEventListener("mousedown", handleOutsideClick);
+  }, []);
+
+  const handleSelectSeason = (seasonNum: number) => {
+    resetControlsTimeout();
+    setIsSeasonMenuOpen(false);
+    if (!canControl) return;
+
+    const targetSeason = effectiveSeries.seasons.find((s) => s.seasonNumber === seasonNum);
+    const firstEp = targetSeason && targetSeason.episodes[0] ? targetSeason.episodes[0] : null;
+    const firstEpNum = firstEp ? firstEp.episodeNumber : 1;
+    const firstEpUrl = firstEp ? firstEp.url : "";
+
+    if (onSelectEpisode && firstEpUrl) {
+      onSelectEpisode(seasonNum, firstEpNum, firstEpUrl);
+    } else {
+      setLocalSeason(seasonNum);
+      setLocalEpisode(firstEpNum);
+      if (videoRef.current) {
+        videoRef.current.currentTime = 0;
+      }
+    }
+  };
+
+  const handleSelectEpisode = (episodeNum: number) => {
+    resetControlsTimeout();
+    setIsEpisodeMenuOpen(false);
+    if (!canControl) return;
+
+    const targetEp = currentSeasonEpisodes.find((ep) => ep.episodeNumber === episodeNum);
+    const epUrl = targetEp ? targetEp.url : "";
+
+    if (onSelectEpisode && epUrl) {
+      onSelectEpisode(selectedSeasonNum, episodeNum, epUrl);
+    } else {
+      setLocalEpisode(episodeNum);
+      if (videoRef.current) {
+        videoRef.current.currentTime = 0;
+      }
+    }
+  };
+
+  const handleQualitySelect = (qualityId: number) => {
+    if (hlsRef.current) {
+      hlsRef.current.currentLevel = qualityId;
+      setSelectedQuality(qualityId);
+      if (qualityId === -1) {
+        console.log("[HLS.js] Switched to Auto (adaptive bitrate selection)");
+      } else {
+        const lvl = hlsRef.current.levels[qualityId];
+        console.log(`[HLS.js] Switched to manual quality: ${lvl?.height || qualityId}p`);
+      }
+    }
+    setShowQualityMenu(false);
+    resetControlsTimeout();
+  };
+
+  // Resolve current active subtitle URL (following selected episode)
+  const activeSubtitleUrl = React.useMemo(() => {
+    if (!subtitle || typeof subtitle !== "string" || !subtitle.trim()) return null;
+    return getSubtitleForEpisode(subtitle, selectedEpisodeNum);
+  }, [subtitle, selectedEpisodeNum]);
+
+  // Load and attach subtitle track to video element via safe fetch, SRT-to-WebVTT conversion & local Blob URL
+  useEffect(() => {
+    const video = videoRef.current;
+    const requestId = ++subtitleRequestIdRef.current;
+
+    // 1. Immediately remove all existing <track> elements from video element DOM and disable tracks
+    if (video) {
+      const existingTracks = video.querySelectorAll("track");
+      existingTracks.forEach((t) => {
+        try {
+          if (t.track) t.track.mode = "disabled";
+        } catch {}
+        t.remove();
+      });
+      if (video.textTracks) {
+        for (let i = 0; i < video.textTracks.length; i++) {
+          try {
+            video.textTracks[i].mode = "disabled";
+          } catch {}
+        }
+      }
+    }
+
+    // 2. Revoke the previous Blob URL once old tracks are removed
+    if (activeBlobUrlRef.current) {
+      URL.revokeObjectURL(activeBlobUrlRef.current);
+      activeBlobUrlRef.current = null;
+    }
+
+    // 3. If no subtitle for this episode, update state and return
+    if (!activeSubtitleUrl) {
+      setHasCurrentSubtitle(false);
+      return;
+    }
+
+    setHasCurrentSubtitle(true);
+
+    // Helper to attach a track with the resolved VTT URL (either blob: or direct URL)
+    const attachTrack = (vttUrl: string, isBlob: boolean) => {
+      if (subtitleRequestIdRef.current !== requestId) {
+        if (isBlob) URL.revokeObjectURL(vttUrl);
+        return;
+      }
+
+      const currentVideo = videoRef.current;
+      if (!currentVideo) {
+        if (isBlob) URL.revokeObjectURL(vttUrl);
+        return;
+      }
+
+      if (isBlob) {
+        activeBlobUrlRef.current = vttUrl;
+      }
+
+      // Ensure old tracks are cleanly gone
+      currentVideo.querySelectorAll("track").forEach((t) => {
+        try {
+          if (t.track) t.track.mode = "disabled";
+        } catch {}
+        t.remove();
+      });
+
+      const trackEl = document.createElement("track");
+      trackEl.kind = "subtitles";
+      trackEl.label = "Subtitles";
+      trackEl.srclang = "en";
+      trackEl.src = vttUrl;
+      trackEl.default = isSubtitlesEnabledRef.current;
+
+      // Handle load event to ensure mode is set correctly once cues are ready
+      const handleTrackLoaded = () => {
+        if (subtitleRequestIdRef.current !== requestId) return;
+        try {
+          if (trackEl.track) {
+            trackEl.track.mode = isSubtitlesEnabledRef.current ? "showing" : "disabled";
+          }
+        } catch {}
+      };
+
+      trackEl.addEventListener("load", handleTrackLoaded);
+      currentVideo.appendChild(trackEl);
+
+      // Also set mode immediately in case load is synchronous or already fired
+      try {
+        if (trackEl.track) {
+          trackEl.track.mode = "hidden";
+          trackEl.track.mode = isSubtitlesEnabledRef.current ? "showing" : "disabled";
+        }
+      } catch {}
+    };
+
+    // Direct blob: or data: URL
+    if (activeSubtitleUrl.startsWith("blob:") || activeSubtitleUrl.startsWith("data:")) {
+      attachTrack(activeSubtitleUrl, false);
+      return;
+    }
+
+    // Fetch remote subtitle, convert SRT to WebVTT, and create a brand new Blob URL
+    const loadSub = async () => {
+      try {
+        const res = await fetch(activeSubtitleUrl);
+        if (!res.ok) {
+          throw new Error(`HTTP error ${res.status}`);
+        }
+        const text = await res.text();
+
+        // If another episode has been selected while fetch was in flight, discard old result
+        if (subtitleRequestIdRef.current !== requestId) {
+          return;
+        }
+
+        const vtt = convertSrtToVtt(text);
+        const blob = new Blob([vtt], { type: "text/vtt" });
+        const localBlobUrl = URL.createObjectURL(blob);
+
+        attachTrack(localBlobUrl, true);
+      } catch (err) {
+        if (subtitleRequestIdRef.current === requestId) {
+          console.warn("Subtitle load failed (CORS or network error). Video playback will continue.", err);
+          setHasCurrentSubtitle(false);
+        }
+      }
+    };
+
+    loadSub();
+  }, [activeSubtitleUrl]);
+
+  // Clean up Blob URL and tracks when player unmounts
+  useEffect(() => {
+    return () => {
+      subtitleRequestIdRef.current += 1;
+      if (activeBlobUrlRef.current) {
+        URL.revokeObjectURL(activeBlobUrlRef.current);
+        activeBlobUrlRef.current = null;
+      }
+      const video = videoRef.current;
+      if (video) {
+        video.querySelectorAll("track").forEach((t) => {
+          try {
+            if (t.track) t.track.mode = "disabled";
+          } catch {}
+          t.remove();
+        });
+      }
+    };
+  }, []);
+
+  const handleToggleSubtitles = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const nextVal = !isSubtitlesEnabled;
+    setIsSubtitlesEnabled(nextVal);
+    isSubtitlesEnabledRef.current = nextVal;
+
+    const video = videoRef.current;
+    if (video && video.textTracks) {
+      for (let i = 0; i < video.textTracks.length; i++) {
+        try {
+          video.textTracks[i].mode = nextVal ? "showing" : "disabled";
+        } catch {}
+      }
+    }
+    resetControlsTimeout();
+  };
+
+  // Auto-hide controls after 2.5 seconds of inactivity
+  const resetControlsTimeout = useCallback(() => {
+    setShowControls(true);
+    if (controlsTimeoutRef.current) {
+      clearTimeout(controlsTimeoutRef.current);
+      controlsTimeoutRef.current = null;
+    }
+    controlsTimeoutRef.current = window.setTimeout(() => {
+      setShowControls(false);
+      setShowAudioMenu(false);
+      setShowDisplayMenu(false);
+      setShowQualityMenu(false);
+      setIsSeasonMenuOpen(false);
+      setIsEpisodeMenuOpen(false);
+      controlsTimeoutRef.current = null;
+    }, 2500);
+  }, []);
+
+  const resetControlsTimeoutRef = useRef(resetControlsTimeout);
+  resetControlsTimeoutRef.current = resetControlsTimeout;
+
+  // Audio Tracks Detection (where browser supports HTML5 audioTracks API or HLS manifest)
+  const detectAudioTracks = useCallback(() => {
+    // If HLS.js is handling audio tracks, preserve HLS audio tracks
+    if (isHlsUrl(effectiveMediaSrc) && isHlsJsSupported() && hlsRef.current) {
+      if (hlsRef.current.audioTracks && hlsRef.current.audioTracks.length > 0) {
+        const tracks = hlsRef.current.audioTracks.map((t, idx) => ({
+          index: idx,
+          label: t.name || t.lang || `Track ${idx + 1}`,
+          enabled: idx === hlsRef.current?.audioTrack,
+        }));
+        setAvailableAudioTracks(tracks);
+        return;
+      }
+    }
+
+    const video = videoRef.current as any;
+    if (video && video.audioTracks && video.audioTracks.length > 0) {
+      const tracks = [];
+      for (let i = 0; i < video.audioTracks.length; i++) {
+        const track = video.audioTracks[i];
+        tracks.push({
+          index: i,
+          label: track.label || track.language || `Track ${i + 1}`,
+          enabled: track.enabled
+        });
+      }
+      setAvailableAudioTracks(tracks);
+    } else {
+      setAvailableAudioTracks([
+        { index: 0, label: "Default Audio", enabled: true }
+      ]);
+    }
+  }, [effectiveMediaSrc]);
+
+  const detectAudioTracksRef = useRef(detectAudioTracks);
+  detectAudioTracksRef.current = detectAudioTracks;
+
+  // Handle incoming remote syncState changes
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !syncState) return;
+
+    const isInitialSync = !hasInitialSyncAppliedRef.current;
+    hasInitialSyncAppliedRef.current = true;
+
+    // Skip if this sync update is older than or equal to the last processed sync update
+    if (
+      !isInitialSync &&
+      lastSyncProcessedRef.current &&
+      syncState.lastUpdated <= lastSyncProcessedRef.current.lastUpdated
+    ) {
+      return;
+    }
+
+    // If local user initiated this action while already actively connected, record it without resetting local playback
+    if (!isInitialSync && syncState.updatedBy === currentUserId) {
+      lastSyncProcessedRef.current = {
+        lastUpdated: syncState.lastUpdated,
+        isPlaying: syncState.isPlaying,
+        currentTime: syncState.currentTime,
+        audioTrackIndex: syncState.audioTrackIndex
+      };
+      return;
+    }
+
+    lastSyncProcessedRef.current = {
+      lastUpdated: syncState.lastUpdated,
+      isPlaying: syncState.isPlaying,
+      currentTime: syncState.currentTime,
+      audioTrackIndex: syncState.audioTrackIndex
+    };
+
+    const now = Date.now();
+    const elapsed = syncState.isPlaying && syncState.lastUpdated
+      ? Math.max(0, (now - syncState.lastUpdated) / 1000)
+      : 0;
+    const expectedTime = syncState.isPlaying
+      ? Math.max(0, syncState.currentTime + elapsed)
+      : syncState.currentTime;
+
+    // On initial sync/rejoin or when time drift exceeds threshold (1.5 seconds)
+    let hasMeaningfulSync = false;
+    const timeDiff = Math.abs(video.currentTime - expectedTime);
+    if (isInitialSync || timeDiff > 1.5) {
+      if (expectedTime > 0 || isInitialSync) {
+        isApplyingRemoteSyncRef.current = true;
+        video.currentTime = expectedTime;
+        setCurrentTime(expectedTime);
+        setTimeout(() => {
+          isApplyingRemoteSyncRef.current = false;
+        }, 200);
+      }
+      hasMeaningfulSync = true;
+    }
+
+    // Match play/pause state
+    if (syncState.isPlaying && video.paused) {
+      isApplyingRemoteSyncRef.current = true;
+      video.play().catch(() => {
+        // Autoplay policy fallback: muted play or wait for interaction
+        console.warn("Autoplay blocked by browser until user gesture");
+      }).finally(() => {
+        setTimeout(() => {
+          isApplyingRemoteSyncRef.current = false;
+        }, 200);
+      });
+      hasMeaningfulSync = true;
+    } else if (!syncState.isPlaying && !video.paused) {
+      isApplyingRemoteSyncRef.current = true;
+      video.pause();
+      setTimeout(() => {
+        isApplyingRemoteSyncRef.current = false;
+      }, 200);
+      hasMeaningfulSync = true;
+    }
+
+    // Match audio track index if provided and supported
+    if (
+      syncState.audioTrackIndex !== undefined &&
+      currentAudioTrack !== syncState.audioTrackIndex
+    ) {
+      if (hlsRef.current && hlsRef.current.audioTracks.length > syncState.audioTrackIndex) {
+        hlsRef.current.audioTrack = syncState.audioTrackIndex;
+        setCurrentAudioTrack(syncState.audioTrackIndex);
+        hasMeaningfulSync = true;
+      } else if (
+        (video as any).audioTracks &&
+        (video as any).audioTracks.length > syncState.audioTrackIndex
+      ) {
+        const audioTracks = (video as any).audioTracks;
+        for (let i = 0; i < audioTracks.length; i++) {
+          audioTracks[i].enabled = i === syncState.audioTrackIndex;
+        }
+        setCurrentAudioTrack(syncState.audioTrackIndex);
+        hasMeaningfulSync = true;
+      }
+    }
+
+    if (hasMeaningfulSync) {
+      triggerSyncIndicator();
+    }
+  }, [syncState, currentUserId, currentAudioTrack, triggerSyncIndicator]);
+
+  // HLS.js Lifecycle & Playback Engine Effect
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    // Reset quality states on media source change
+    setAvailableQualities([]);
+    setSelectedQuality(-1);
+    setCurrentQualityHeight(null);
+    setShowQualityMenu(false);
+    networkRetryCountRef.current = 0;
+    mediaRetryCountRef.current = 0;
+
+    const isHls = isHlsUrl(effectiveMediaSrc);
+    const safeUrl = sanitizeMediaUrl(effectiveMediaSrc);
+
+    // Destroy existing HLS instance if present
+    if (hlsRef.current) {
+      console.log(`[HLS.js] Cleaning up previous HLS instance before loading: ${safeUrl}`);
+      try {
+        hlsRef.current.detachMedia();
+        hlsRef.current.destroy();
+      } catch (err) {
+        console.warn("[HLS.js] Error cleaning up HLS instance:", err);
+      }
+      hlsRef.current = null;
+    }
+
+    if (!isHls) {
+      // Ordinary MP4, WebM, or local Blob URL
+      if (video.src !== effectiveMediaSrc) {
+        video.src = effectiveMediaSrc;
+      }
+      return;
+    }
+
+    // HLS Stream (.m3u8)
+    if (isHlsJsSupported()) {
+      console.log(`[HLS.js] Initializing HLS.js engine for stream: ${safeUrl}`);
+
+      const hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: true,
+        backBufferLength: 90,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
+      });
+
+      hlsRef.current = hls;
+
+      hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+        console.log(`[HLS.js] Media attached to video element for: ${safeUrl}`);
+      });
+
+      hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
+        console.log(
+          `[HLS.js] Manifest loaded for ${safeUrl}: ${data.levels.length} quality level(s), ${hls.audioTracks?.length || 0} audio track(s).`
+        );
+        setPlaybackError(null);
+        setIsBuffering(false);
+
+        // Format and set quality levels
+        const qualityOptions = formatQualityLevels(data.levels);
+        setAvailableQualities(qualityOptions);
+
+        // Detect and set alternate audio tracks
+        if (hls.audioTracks && hls.audioTracks.length > 0) {
+          const tracks = hls.audioTracks.map((t, idx) => ({
+            index: idx,
+            label: t.name || t.lang || `Track ${idx + 1}`,
+            enabled: idx === hls.audioTrack,
+          }));
+          setAvailableAudioTracks(tracks);
+          setCurrentAudioTrack(hls.audioTrack >= 0 ? hls.audioTrack : 0);
+        }
+
+        // Apply room synchronization timeline upon manifest parsed
+        if (syncStateRef.current) {
+          const sync = syncStateRef.current;
+          const now = Date.now();
+          const elapsed = sync.isPlaying && sync.lastUpdated
+            ? Math.max(0, (now - sync.lastUpdated) / 1000)
+            : 0;
+          const expectedTime = sync.isPlaying
+            ? Math.max(0, sync.currentTime + elapsed)
+            : Math.max(0, sync.currentTime);
+
+          if (expectedTime > 0) {
+            isApplyingRemoteSyncRef.current = true;
+            video.currentTime = expectedTime;
+            setCurrentTime(expectedTime);
+            setTimeout(() => {
+              isApplyingRemoteSyncRef.current = false;
+            }, 200);
+          }
+
+          if (sync.isPlaying && video.paused) {
+            isApplyingRemoteSyncRef.current = true;
+            video.play().catch(() => {}).finally(() => {
+              setTimeout(() => {
+                isApplyingRemoteSyncRef.current = false;
+              }, 200);
+            });
+          } else if (!sync.isPlaying && !video.paused) {
+            video.pause();
+          }
+        }
+      });
+
+      hls.on(Hls.Events.LEVEL_SWITCHED, (event, data) => {
+        const level = hls.levels[data.level];
+        if (level && level.height) {
+          setCurrentQualityHeight(level.height);
+          console.log(`[HLS.js] Switched to resolution: ${level.height}p (level ${data.level})`);
+        }
+      });
+
+      hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (event, data) => {
+        if (data.audioTracks && data.audioTracks.length > 0) {
+          const tracks = data.audioTracks.map((t, idx) => ({
+            index: idx,
+            label: t.name || t.lang || `Track ${idx + 1}`,
+            enabled: idx === hls.audioTrack,
+          }));
+          setAvailableAudioTracks(tracks);
+        }
+      });
+
+      hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (event, data) => {
+        setCurrentAudioTrack(data.id);
+      });
+
+      hls.on(Hls.Events.ERROR, (event, data) => {
+        if (data.fatal) {
+          console.warn(`[HLS.js] Fatal Error for ${safeUrl}:`, data.type, data.details);
+          switch (data.type) {
+            case Hls.ErrorTypes.NETWORK_ERROR: {
+              const isCorsFailure =
+                data.response?.code === 0 ||
+                (data.details === Hls.ErrorDetails.MANIFEST_LOAD_ERROR && (!data.response || data.response.code === 0));
+
+              if (isCorsFailure) {
+                console.error(`[HLS.js] CORS access blocked for stream: ${safeUrl}`);
+                setPlaybackError(
+                  "Cross-Origin (CORS) restriction: The HLS streaming server blocked access from this domain. Ensure 'Access-Control-Allow-Origin: *' is configured on the stream host."
+                );
+                hls.destroy();
+                break;
+              }
+
+              if (networkRetryCountRef.current < 3) {
+                networkRetryCountRef.current += 1;
+                console.log(`[HLS.js] Retrying recoverable network error (${networkRetryCountRef.current}/3)...`);
+                setTimeout(() => {
+                  if (hlsRef.current === hls) {
+                    hls.startLoad();
+                  }
+                }, 1000);
+              } else {
+                console.error(`[HLS.js] Network error retry limit reached for: ${safeUrl}`);
+                setPlaybackError(
+                  "Network error: Failed to download HLS video segments or manifest. Please verify your stream URL and network connection."
+                );
+                hls.destroy();
+              }
+              break;
+            }
+
+            case Hls.ErrorTypes.MEDIA_ERROR: {
+              if (mediaRetryCountRef.current < 2) {
+                mediaRetryCountRef.current += 1;
+                console.log(`[HLS.js] Recovering media error (${mediaRetryCountRef.current}/2)...`);
+                hls.recoverMediaError();
+              } else if (mediaRetryCountRef.current === 2) {
+                mediaRetryCountRef.current += 1;
+                console.log(`[HLS.js] Swapping audio codec and recovering media error...`);
+                hls.swapAudioCodec();
+                hls.recoverMediaError();
+              } else {
+                console.error(`[HLS.js] Media recovery failed for: ${safeUrl}`);
+                setPlaybackError(
+                  "Media decode error: The video or audio codec in this HLS stream could not be decoded by your device."
+                );
+                hls.destroy();
+              }
+              break;
+            }
+
+            default:
+              console.error(`[HLS.js] Unrecoverable stream error (${data.details}) for: ${safeUrl}`);
+              setPlaybackError(`HLS stream playback failed: ${data.details || "Stream format error"}.`);
+              hls.destroy();
+              break;
+          }
+        }
+      });
+
+      hls.loadSource(effectiveMediaSrc);
+      hls.attachMedia(video);
+    } else if (isNativeHlsSupported(video)) {
+      console.log(`[HLS] Browser supports native HLS playback (Safari): ${safeUrl}`);
+      video.src = effectiveMediaSrc;
+    } else {
+      console.error(`[HLS] HLS playback is not supported on this browser: ${safeUrl}`);
+      setPlaybackError("HLS (.m3u8) video streaming is not supported on this browser.");
+    }
+
+    return () => {
+      if (hlsRef.current) {
+        console.log(`[HLS.js] Teardown HLS instance for: ${safeUrl}`);
+        try {
+          hlsRef.current.detachMedia();
+          hlsRef.current.destroy();
+        } catch {}
+        hlsRef.current = null;
+      }
+    };
+  }, [effectiveMediaSrc]);
+
+  // Video listeners: mounted with [effectiveMediaSrc] to prevent teardown/re-attach on unrelated renders (e.g. chat)
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    // Check immediately on mount/src change: if video is paused or already ready, clear buffering
+    if (video.readyState >= 3 || video.paused) {
+      setIsBuffering(false);
+    }
+
+    const onPlay = () => {
+      setIsPlaying(true);
+      if (video.readyState >= 3) {
+        setIsBuffering(false);
+      }
+      resetControlsTimeoutRef.current?.();
+    };
+
+    const onPause = () => {
+      setIsPlaying(false);
+      // Immediately clear buffering on pause: a paused video must never show a buffering indicator
+      setIsBuffering(false);
+      resetControlsTimeoutRef.current?.();
+
+      // Detect external/system pauses (e.g. phone calls, OS audio interruption).
+      // Do not sync these unexpected system pauses to the room!
+      if (!isUserIntentionalActionRef.current && !isApplyingRemoteSyncRef.current) {
+        hasSystemInterruptionRef.current = true;
+        console.log("System interruption detected on video playback. Will not sync pause to room.");
+      }
+      isUserIntentionalActionRef.current = false;
+    };
+
+    const onTimeUpdate = () => {
+      if (!isSeekingRef.current) {
+        setCurrentTime(video.currentTime);
+      }
+      // Update buffered
+      if (video.buffered.length > 0) {
+        setBufferedEnd(video.buffered.end(video.buffered.length - 1));
+      }
+      // If time is advancing, video is playing smoothly and not buffering
+      setIsBuffering(false);
+
+      // Black screen detection on Apple devices:
+      // If audio is playing for more than 1.5 seconds, but zero video frames were rendered
+      // or video dimensions failed to initialize on an MP4 file
+      if (
+        isAppleWebKitDevice() &&
+        !isHlsUrl(effectiveMediaSrc) &&
+        !hasProbedCodecRef.current &&
+        video.currentTime > 1.5 &&
+        !video.paused
+      ) {
+        const decodedFrames = (video as any).webkitDecodedFrameCount;
+        const zeroFrames = decodedFrames !== undefined && decodedFrames === 0;
+        const zeroDims = video.videoWidth === 0 && video.videoHeight === 0;
+
+        if (zeroFrames || zeroDims) {
+          console.warn("[Apple WebKit] Zero video frames rendered during active playback. Running codec diagnosis...");
+          runCodecDiagnosis(true);
+        }
+      }
+    };
+
+    const onLoadedMetadata = () => {
+      setDuration(video.duration);
+      setIsBuffering(false);
+      setPlaybackError(null);
+      detectAudioTracksRef.current?.();
+
+      // Restore synchronized room timeline upon metadata loaded
+      if (syncStateRef.current) {
+        const sync = syncStateRef.current;
+        const now = Date.now();
+        const elapsed = sync.isPlaying && sync.lastUpdated
+          ? Math.max(0, (now - sync.lastUpdated) / 1000)
+          : 0;
+        const expectedTime = sync.isPlaying
+          ? Math.min(video.duration || Infinity, Math.max(0, sync.currentTime + elapsed))
+          : Math.min(video.duration || Infinity, Math.max(0, sync.currentTime));
+
+        if (expectedTime > 0) {
+          isApplyingRemoteSyncRef.current = true;
+          video.currentTime = expectedTime;
+          setCurrentTime(expectedTime);
+          setTimeout(() => {
+            isApplyingRemoteSyncRef.current = false;
+          }, 200);
+        }
+
+        if (sync.isPlaying && video.paused) {
+          isApplyingRemoteSyncRef.current = true;
+          video.play().catch(() => {}).finally(() => {
+            setTimeout(() => {
+              isApplyingRemoteSyncRef.current = false;
+            }, 200);
+          });
+        } else if (!sync.isPlaying && !video.paused) {
+          video.pause();
+        }
+      }
+    };
+
+    const onWaiting = () => {
+      // Only show buffering indicator if video is playing, not ended, and actively lacking media data
+      if (video && !video.paused && !video.ended && video.readyState < 3) {
+        setIsBuffering(true);
+        wasBufferingRef.current = true;
+      }
+    };
+
+    const onStalled = () => {
+      if (video && !video.paused && !video.ended && video.readyState < 3) {
+        setIsBuffering(true);
+        wasBufferingRef.current = true;
+      }
+    };
+
+    const onSeeking = () => {
+      if (video && !video.paused && !video.ended && video.readyState < 3) {
+        setIsBuffering(true);
+      }
+    };
+
+    const onSeeked = () => {
+      setIsBuffering(false);
+    };
+
+    const onPlaying = () => {
+      setIsBuffering(false);
+
+      // Single-shot buffering recovery:
+      // If the video was genuinely buffering/stalled and has now recovered,
+      // fetch the latest room playback state once to resync any lost timeline drift
+      if (wasBufferingRef.current && !isRecoveringFromBufferRef.current && roomCode) {
+        wasBufferingRef.current = false;
+        isRecoveringFromBufferRef.current = true;
+
+        const capturedMediaKey = currentMediaKeyRef.current;
+        const capturedRoomCode = roomCode;
+        const playbackRef = ref(rtdb, `rooms/${capturedRoomCode}/playbackState`);
+
+        get(playbackRef)
+          .then((snapshot) => {
+            const currentVid = videoRef.current;
+            // Ignore stale recovery request if media, room, or video element has changed
+            if (
+              !currentVid ||
+              currentMediaKeyRef.current !== capturedMediaKey ||
+              roomCode !== capturedRoomCode
+            ) {
+              return;
+            }
+
+            const latestState = snapshot.val();
+            if (!latestState || typeof latestState.currentTime !== "number") return;
+
+            const now = Date.now();
+            const elapsed = latestState.isPlaying && latestState.lastUpdated
+              ? Math.max(0, (now - latestState.lastUpdated) / 1000)
+              : 0;
+            const expectedTime = latestState.isPlaying
+              ? Math.max(0, latestState.currentTime + elapsed)
+              : latestState.currentTime;
+
+            const timeDiff = Math.abs(currentVid.currentTime - expectedTime);
+
+            // If time drift is noticeable (> 1.0s), resync local playback position
+            if (timeDiff > 1.0) {
+              isApplyingRemoteSyncRef.current = true;
+              currentVid.currentTime = expectedTime;
+              setCurrentTime(expectedTime);
+              triggerSyncIndicator();
+              setTimeout(() => {
+                isApplyingRemoteSyncRef.current = false;
+              }, 200);
+            }
+
+            // Also ensure play/pause matches latest room timeline
+            if (latestState.isPlaying && currentVid.paused) {
+              isApplyingRemoteSyncRef.current = true;
+              currentVid.play().catch(() => {}).finally(() => {
+                setTimeout(() => {
+                  isApplyingRemoteSyncRef.current = false;
+                }, 200);
+              });
+            } else if (!latestState.isPlaying && !currentVid.paused) {
+              isApplyingRemoteSyncRef.current = true;
+              currentVid.pause();
+              setTimeout(() => {
+                isApplyingRemoteSyncRef.current = false;
+              }, 200);
+            }
+          })
+          .catch((err) => {
+            console.warn("Buffering recovery sync fetch notice:", err);
+          })
+          .finally(() => {
+            isRecoveringFromBufferRef.current = false;
+          });
+      } else {
+        wasBufferingRef.current = false;
+      }
+    };
+
+    const onCanPlay = () => {
+      setIsBuffering(false);
+    };
+
+    const onCanPlayThrough = () => {
+      setIsBuffering(false);
+    };
+
+    const onProgress = () => {
+      if (video.buffered.length > 0) {
+        const bufferedEndVal = video.buffered.end(video.buffered.length - 1);
+        setBufferedEnd(bufferedEndVal);
+        if (video.currentTime < bufferedEndVal) {
+          setIsBuffering(false);
+        }
+      }
+    };
+
+    const onLoadedData = () => {
+      setIsBuffering(false);
+      setPlaybackError(null);
+    };
+
+    const onError = () => {
+      // If HLS.js is actively managing the video element, error handling and recoveries are handled via HLS events
+      if (isHlsUrl(effectiveMediaSrc) && isHlsJsSupported() && hlsRef.current) {
+        setIsBuffering(false);
+        return;
+      }
+      setIsBuffering(false);
+      const err = video.error;
+
+      // If playing on Apple device and encountering a decode or unsupported source error on MP4
+      if (
+        isAppleWebKitDevice() &&
+        !isHlsUrl(effectiveMediaSrc) &&
+        (effectiveMediaSrc.includes(".mp4") ||
+          err?.code === MediaError.MEDIA_ERR_DECODE ||
+          err?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED)
+      ) {
+        runCodecDiagnosis(false);
+      }
+
+      let msg = "Playback failed: Unable to load or play video stream.";
+      if (
+        err?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED ||
+        err?.code === MediaError.MEDIA_ERR_DECODE ||
+        effectiveMediaSrc.startsWith("blob:")
+      ) {
+        msg = "Your device's media decoder could not decode this video codec or track. Please select a video encoded with a supported codec (such as H.264/AVC or HLS .m3u8).";
+      } else if (err?.code === MediaError.MEDIA_ERR_NETWORK) {
+        msg = "A network error caused the video download to fail.";
+      }
+      setPlaybackError(msg);
+    };
+
+    const onEnded = () => {
+      setIsPlaying(false);
+      setIsBuffering(false);
+      if (onVideoEndedRef.current) onVideoEndedRef.current();
+    };
+
+    video.addEventListener("play", onPlay);
+    video.addEventListener("pause", onPause);
+    video.addEventListener("timeupdate", onTimeUpdate);
+    video.addEventListener("loadedmetadata", onLoadedMetadata);
+    video.addEventListener("loadeddata", onLoadedData);
+    video.addEventListener("waiting", onWaiting);
+    video.addEventListener("stalled", onStalled);
+    video.addEventListener("seeking", onSeeking);
+    video.addEventListener("seeked", onSeeked);
+    video.addEventListener("playing", onPlaying);
+    video.addEventListener("canplay", onCanPlay);
+    video.addEventListener("canplaythrough", onCanPlayThrough);
+    video.addEventListener("progress", onProgress);
+    video.addEventListener("error", onError);
+    video.addEventListener("ended", onEnded);
+
+    return () => {
+      setIsBuffering(false);
+      wasBufferingRef.current = false;
+      video.removeEventListener("play", onPlay);
+      video.removeEventListener("pause", onPause);
+      video.removeEventListener("timeupdate", onTimeUpdate);
+      video.removeEventListener("loadedmetadata", onLoadedMetadata);
+      video.removeEventListener("loadeddata", onLoadedData);
+      video.removeEventListener("waiting", onWaiting);
+      video.removeEventListener("stalled", onStalled);
+      video.removeEventListener("seeking", onSeeking);
+      video.removeEventListener("seeked", onSeeked);
+      video.removeEventListener("playing", onPlaying);
+      video.removeEventListener("canplay", onCanPlay);
+      video.removeEventListener("canplaythrough", onCanPlayThrough);
+      video.removeEventListener("progress", onProgress);
+      video.removeEventListener("error", onError);
+      video.removeEventListener("ended", onEnded);
+    };
+  }, [effectiveMediaSrc]);
+
+  // Keep Android screen awake while video is actively playing
+  useEffect(() => {
+    setKeepScreenOn(isPlaying);
+    return () => {
+      setKeepScreenOn(false);
+    };
+  }, [isPlaying]);
+
+  // Screen Orientation helpers for mobile fullscreen
+  const lockLandscapeOrientation = useCallback(async () => {
+    try {
+      if (isNativeApp()) {
+        await enterNativeFullscreen();
+        return;
+      }
+      const orientation =
+        window.screen?.orientation ||
+        (window.screen as any)?.mozOrientation ||
+        (window.screen as any)?.msOrientation;
+
+      if (orientation && typeof orientation.lock === "function") {
+        await orientation.lock("landscape").catch(() => {
+          // Ignore browsers/devices that reject or do not support programmatic orientation lock
+        });
+      } else if ((window.screen as any)?.lockOrientation) {
+        (window.screen as any).lockOrientation("landscape");
+      } else if ((window.screen as any)?.mozLockOrientation) {
+        (window.screen as any)?.mozLockOrientation("landscape");
+      } else if ((window.screen as any)?.msLockOrientation) {
+        (window.screen as any).msLockOrientation("landscape");
+      }
+    } catch {
+      // Safe fallback - do not crash
+    }
+  }, []);
+
+  const unlockScreenOrientation = useCallback(() => {
+    try {
+      if (isNativeApp()) {
+        exitNativeFullscreen().catch(() => {});
+        return;
+      }
+      const orientation =
+        window.screen?.orientation ||
+        (window.screen as any)?.mozOrientation ||
+        (window.screen as any)?.msOrientation;
+
+      if (orientation && typeof orientation.unlock === "function") {
+        orientation.unlock();
+      } else if ((window.screen as any)?.unlockOrientation) {
+        (window.screen as any).unlockOrientation();
+      } else if ((window.screen as any)?.mozUnlockOrientation) {
+        (window.screen as any).mozUnlockOrientation();
+      } else if ((window.screen as any)?.msUnlockOrientation) {
+        (window.screen as any).msUnlockOrientation();
+      }
+    } catch {
+      // Safe fallback - do not crash
+    }
+  }, []);
+
+  const isCurrentlyFullscreen = useCallback(() => {
+    return !!(
+      document.fullscreenElement ||
+      (document as any).webkitFullscreenElement ||
+      (document as any).mozFullScreenElement ||
+      (document as any).msFullscreenElement ||
+      (videoRef.current as any)?.webkitDisplayingFullscreen ||
+      document.documentElement.dataset.videoFullscreen === "true"
+    );
+  }, []);
+
+  // Fullscreen change listener & mobile orientation lock
+  useEffect(() => {
+    const enterFsState = () => {
+      setIsFullscreen(true);
+      isFullscreenRef.current = true;
+      fullscreenEnteredAtRef.current = Date.now();
+      document.documentElement.dataset.videoFullscreen = "true";
+      lockLandscapeOrientation();
+    };
+
+    const exitFsState = () => {
+      setIsFullscreen(false);
+      isFullscreenRef.current = false;
+      fullscreenEnteredAtRef.current = Infinity;
+      delete document.documentElement.dataset.videoFullscreen;
+      setFullscreenChatOverlay(null);
+      if (overlayTimerRef.current) {
+        clearTimeout(overlayTimerRef.current);
+        overlayTimerRef.current = null;
+      }
+      unlockScreenOrientation();
+    };
+
+    const handleFullscreenChange = () => {
+      const domFs = !!(
+        document.fullscreenElement ||
+        (document as any).webkitFullscreenElement ||
+        (document as any).mozFullScreenElement ||
+        (document as any).msFullscreenElement ||
+        (videoRef.current as any)?.webkitDisplayingFullscreen
+      );
+      if (domFs) {
+        enterFsState();
+      } else {
+        exitFsState();
+      }
+    };
+
+    const handleForcedExitEvent = () => {
+      const video = videoRef.current as any;
+      if (document.fullscreenElement && document.exitFullscreen) {
+        document.exitFullscreen().catch(() => exitFsState());
+      } else if ((document as any).webkitFullscreenElement && (document as any).webkitExitFullscreen) {
+        (document as any).webkitExitFullscreen();
+      } else if (video?.webkitDisplayingFullscreen && typeof video.webkitExitFullscreen === "function") {
+        video.webkitExitFullscreen();
+      } else {
+        exitFsState();
+      }
+    };
+
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    document.addEventListener("webkitfullscreenchange", handleFullscreenChange);
+    document.addEventListener("mozfullscreenchange", handleFullscreenChange);
+    document.addEventListener("MSFullscreenChange", handleFullscreenChange);
+    window.addEventListener("muvidate:exit-fullscreen", handleForcedExitEvent);
+
+    const video = videoRef.current;
+    const onWebkitBegin = () => {
+      enterFsState();
+    };
+    const onWebkitEnd = () => {
+      exitFsState();
+    };
+
+    if (video) {
+      video.addEventListener("webkitbeginfullscreen", onWebkitBegin);
+      video.addEventListener("webkitendfullscreen", onWebkitEnd);
+    }
+
+    return () => {
+      document.removeEventListener("fullscreenchange", handleFullscreenChange);
+      document.removeEventListener("webkitfullscreenchange", handleFullscreenChange);
+      document.removeEventListener("mozfullscreenchange", handleFullscreenChange);
+      document.removeEventListener("MSFullscreenChange", handleFullscreenChange);
+      window.removeEventListener("muvidate:exit-fullscreen", handleForcedExitEvent);
+      if (video) {
+        video.removeEventListener("webkitbeginfullscreen", onWebkitBegin);
+        video.removeEventListener("webkitendfullscreen", onWebkitEnd);
+      }
+      if (isFullscreenRef.current || document.documentElement.dataset.videoFullscreen === "true") {
+        if (document.fullscreenElement && document.exitFullscreen) {
+          document.exitFullscreen().catch(() => {});
+        }
+        delete document.documentElement.dataset.videoFullscreen;
+        unlockScreenOrientation();
+      }
+    };
+  }, [lockLandscapeOrientation, unlockScreenOrientation]);
+
+  // Sync fullscreen state ref
+  useEffect(() => {
+    isFullscreenRef.current = isFullscreen;
+    if (isFullscreen) {
+      fullscreenEnteredAtRef.current = Date.now();
+    } else {
+      fullscreenEnteredAtRef.current = Infinity;
+      if (overlayTimerRef.current) {
+        clearTimeout(overlayTimerRef.current);
+        overlayTimerRef.current = null;
+      }
+      setFullscreenChatOverlay(null);
+    }
+  }, [isFullscreen]);
+
+  // Realtime Database Fullscreen Chat Message Overlay Listener
+  useEffect(() => {
+    if (!roomCode) return;
+
+    const chatRef = ref(rtdb, `rooms/${roomCode}/chat`);
+
+    const handleChildAdded = (snapshot: any) => {
+      const msg = snapshot.val();
+      if (!msg) return;
+
+      // Only show when in fullscreen
+      if (!isFullscreenRef.current) return;
+
+      // Do not show user's own message
+      if (currentUserId && msg.uid === currentUserId) return;
+
+      // Only show messages received after the user entered fullscreen; do not replay old chat messages
+      const msgTime = Number(msg.createdAt) || 0;
+      if (msgTime < fullscreenEnteredAtRef.current) return;
+
+      const displayContent = msg.text || "";
+
+      if (!displayContent) return;
+
+      setFullscreenChatOverlay({
+        id: snapshot.key || Date.now().toString(),
+        username: msg.username || "Participant",
+        text: displayContent
+      });
+
+      if (overlayTimerRef.current) {
+        clearTimeout(overlayTimerRef.current);
+      }
+      overlayTimerRef.current = window.setTimeout(() => {
+        setFullscreenChatOverlay(null);
+        overlayTimerRef.current = null;
+      }, 2000);
+    };
+
+    onChildAdded(chatRef, handleChildAdded);
+
+    return () => {
+      off(chatRef, "child_added", handleChildAdded);
+      if (overlayTimerRef.current) {
+        clearTimeout(overlayTimerRef.current);
+        overlayTimerRef.current = null;
+      }
+    };
+  }, [roomCode, currentUserId]);
+
+  // Keyboard controls
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Don't intercept when typing in inputs/chat
+      if (["INPUT", "TEXTAREA"].includes((e.target as HTMLElement).tagName)) {
+        return;
+      }
+
+      if (e.code === "Space") {
+        e.preventDefault();
+        togglePlayPause();
+      } else if (e.code === "ArrowLeft") {
+        e.preventDefault();
+        seekRelative(-10);
+      } else if (e.code === "ArrowRight") {
+        e.preventDefault();
+        seekRelative(10);
+      } else if (e.key.toLowerCase() === "m") {
+        e.preventDefault();
+        toggleMute();
+      } else if (e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        toggleFullscreen();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  });
+
+  const emitPlaybackState = (newPlaying: boolean, newTime: number) => {
+    if (!canControl) return;
+    triggerSyncIndicator();
+    lastEmittedState.current = { isPlaying: newPlaying, currentTime: newTime };
+    if (onPlaybackChange) {
+      onPlaybackChange({ isPlaying: newPlaying, currentTime: newTime });
+    }
+  };
+
+  const togglePlayPause = async () => {
+    if (!canControl) return;
+
+    const video = videoRef.current;
+    if (!video) return;
+
+    if (video.paused) {
+      // If resuming after a system interruption, fetch the latest timeline from RTDB before playing
+      if (hasSystemInterruptionRef.current) {
+        hasSystemInterruptionRef.current = false;
+        if (roomCode) {
+          try {
+            const playbackRef = ref(rtdb, `rooms/${roomCode}/playbackState`);
+            const snap = await get(playbackRef);
+            if (snap.exists()) {
+              const latest = snap.val();
+              if (latest) {
+                const now = Date.now();
+                const elapsed = latest.isPlaying && latest.lastUpdated
+                  ? Math.max(0, (now - latest.lastUpdated) / 1000)
+                  : 0;
+                const expectedTime = latest.isPlaying
+                  ? Math.max(0, latest.currentTime + elapsed)
+                  : latest.currentTime;
+                const bounded = Math.min(video.duration || expectedTime, expectedTime);
+                video.currentTime = bounded;
+                setCurrentTime(bounded);
+              }
+            }
+          } catch (err) {
+            console.error("Failed to recover timeline after interruption:", err);
+          }
+        }
+      }
+
+      isUserIntentionalActionRef.current = true;
+      video.play().then(() => {
+        emitPlaybackState(true, video.currentTime);
+      }).catch(console.error);
+    } else {
+      isUserIntentionalActionRef.current = true;
+      video.pause();
+      emitPlaybackState(false, video.currentTime);
+    }
+  };
+
+  const seekRelative = (seconds: number) => {
+    if (!canControl) return;
+    isUserIntentionalActionRef.current = true;
+    const target = Math.max(0, Math.min(duration || 0, currentTime + seconds));
+    setCurrentTime(target);
+    const video = videoRef.current;
+    if (!video) return;
+    video.currentTime = target;
+    emitPlaybackState(!video.paused, target);
+  };
+
+  const handleSeekChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!canControl) return;
+    const target = Number(e.target.value);
+    setCurrentTime(target);
+  };
+
+  const handleSeekStart = () => {
+    if (!canControl) return;
+    isSeekingRef.current = true;
+  };
+
+  const handleSeekEnd = (e: React.MouseEvent<HTMLInputElement> | React.TouchEvent<HTMLInputElement>) => {
+    if (!canControl) return;
+    isSeekingRef.current = false;
+    isUserIntentionalActionRef.current = true;
+    const video = videoRef.current;
+    if (video) {
+      video.currentTime = currentTime;
+      emitPlaybackState(!video.paused, currentTime);
+    }
+  };
+
+  const handleVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = Number(e.target.value);
+    setVolume(val);
+    const nextMuted = val === 0;
+    setIsMuted(nextMuted);
+    if (videoRef.current) {
+      videoRef.current.volume = val;
+      videoRef.current.muted = nextMuted;
+    }
+  };
+
+  const toggleMute = () => {
+    const nextMuted = !isMuted;
+    setIsMuted(nextMuted);
+    if (videoRef.current) {
+      videoRef.current.muted = nextMuted;
+    }
+    resetControlsTimeout();
+  };
+
+  const handleAudioTrackSelect = (trackIndex: number) => {
+    if (hlsRef.current && availableAudioTracks.length > 0) {
+      hlsRef.current.audioTrack = trackIndex;
+      setCurrentAudioTrack(trackIndex);
+      if (onAudioTrackChange && canControl) {
+        triggerSyncIndicator();
+        onAudioTrackChange(trackIndex);
+      }
+    } else {
+      const video = videoRef.current as any;
+      if (video && video.audioTracks && video.audioTracks.length > trackIndex) {
+        for (let i = 0; i < video.audioTracks.length; i++) {
+          video.audioTracks[i].enabled = i === trackIndex;
+        }
+        setCurrentAudioTrack(trackIndex);
+        if (onAudioTrackChange && canControl) {
+          triggerSyncIndicator();
+          onAudioTrackChange(trackIndex);
+        }
+      } else {
+        setCurrentAudioTrack(trackIndex);
+      }
+    }
+    setShowAudioMenu(false);
+    resetControlsTimeout();
+  };
+
+  const toggleFullscreen = () => {
+    const container = containerRef.current;
+    const video = videoRef.current;
+    if (!container) return;
+
+    const isFs = isFullscreen || isCurrentlyFullscreen();
+
+    if (!isFs) {
+      if (container.requestFullscreen) {
+        container
+          .requestFullscreen()
+          .then(() => {
+            lockLandscapeOrientation();
+          })
+          .catch((err) => {
+            console.warn("Container requestFullscreen failed, attempting fallback:", err);
+            if (isNativeApp()) {
+              setIsFullscreen(true);
+              isFullscreenRef.current = true;
+              fullscreenEnteredAtRef.current = Date.now();
+              lockLandscapeOrientation();
+            } else if (video && typeof (video as any).webkitEnterFullscreen === "function") {
+              (video as any).webkitEnterFullscreen();
+            }
+          });
+      } else if ((container as any).webkitRequestFullscreen) {
+        (container as any).webkitRequestFullscreen();
+        lockLandscapeOrientation();
+      } else if (isNativeApp()) {
+        setIsFullscreen(true);
+        isFullscreenRef.current = true;
+        fullscreenEnteredAtRef.current = Date.now();
+        lockLandscapeOrientation();
+      } else if (video && typeof (video as any).webkitEnterFullscreen === "function") {
+        (video as any).webkitEnterFullscreen();
+      }
+    } else {
+      setIsFullscreen(false);
+      isFullscreenRef.current = false;
+      delete document.documentElement.dataset.videoFullscreen;
+      unlockScreenOrientation();
+      if (document.fullscreenElement && document.exitFullscreen) {
+        document.exitFullscreen().catch(console.warn);
+      } else if ((document as any).webkitFullscreenElement && (document as any).webkitExitFullscreen) {
+        (document as any).webkitExitFullscreen();
+      } else if (video && (video as any).webkitDisplayingFullscreen && typeof (video as any).webkitExitFullscreen === "function") {
+        (video as any).webkitExitFullscreen();
+      }
+    }
+  };
+
+  const formatTime = (seconds: number) => {
+    if (isNaN(seconds) || !isFinite(seconds)) return "00:00";
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    if (h > 0) {
+      return `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+    }
+    return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+  };
+
+  const progressPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
+  const bufferedPercent = duration > 0 ? (bufferedEnd / duration) * 100 : 0;
+
+  // Track timestamp when controls were revealed from a hidden state.
+  // Any button click within 450ms of a reveal tap is safely ignored to prevent
+  // the first reveal tap from accidentally triggering newly revealed controls on touchscreen devices.
+  const controlsRevealedAtRef = useRef<number>(0);
+
+  const isRevealTapRecently = useCallback(() => {
+    return Date.now() - controlsRevealedAtRef.current < 450;
+  }, []);
+
+  const revealControls = useCallback(() => {
+    controlsRevealedAtRef.current = Date.now();
+    setShowControls(true);
+    resetControlsTimeout();
+  }, [resetControlsTimeout]);
+
+  // Handle tap / click anywhere on the player background or video element.
+  // CRITICAL REQUIREMENT: This handler NEVER toggles playback!
+  // Playback toggles ONLY through dedicated Play/Pause buttons.
+  const handleBackgroundClick = useCallback((e: React.MouseEvent | React.PointerEvent) => {
+    const target = e.target as HTMLElement | null;
+    if (target && target.closest("button, input, select, a, [role='button'], [data-control='true']")) {
+      return;
+    }
+
+    if (isRevealTapRecently()) {
+      return;
+    }
+
+    if (!showControls) {
+      revealControls();
+    } else {
+      // If controls are currently visible, tapping the empty background hides them
+      setShowControls(false);
+      setShowAudioMenu(false);
+      setShowDisplayMenu(false);
+      setShowQualityMenu(false);
+      setIsSeasonMenuOpen(false);
+      setIsEpisodeMenuOpen(false);
+      if (controlsTimeoutRef.current) {
+        clearTimeout(controlsTimeoutRef.current);
+        controlsTimeoutRef.current = null;
+      }
+    }
+  }, [showControls, isRevealTapRecently, revealControls]);
+
+  return (
+    <div
+      ref={containerRef}
+      onPointerMove={(e) => {
+        if (e.pointerType === "mouse") {
+          resetControlsTimeout();
+        }
+      }}
+      onMouseMove={() => {
+        resetControlsTimeout();
+      }}
+      onClick={handleBackgroundClick}
+      className={
+        isFullscreen
+          ? "fixed inset-0 z-[20000] w-full h-full bg-black rounded-none border-0 overflow-hidden group select-none flex items-center justify-center"
+          : "relative w-full aspect-video bg-black rounded-2xl overflow-hidden group select-none shadow-2xl border border-neutral-800 flex items-center justify-center"
+      }
+    >
+      {/* HTML5 Video Element - Clicking or tapping the video NEVER toggles playback */}
+      <video
+        ref={videoRef}
+        src={isHlsUrl(effectiveMediaSrc) && isHlsJsSupported() ? undefined : effectiveMediaSrc}
+        poster={poster}
+        playsInline
+        // @ts-ignore
+        webkit-playsinline="true"
+        x5-playsinline="true"
+        preload="metadata"
+        className={`w-full h-full cursor-pointer ${
+          displayMode === "fit"
+            ? "object-contain"
+            : displayMode === "zoom"
+              ? "object-cover"
+              : "object-fill"
+        }`}
+        onClick={(e) => {
+          e.stopPropagation();
+          handleBackgroundClick(e);
+        }}
+      />
+
+      {/* Tap-to-Reveal Overlay: Active ONLY when controls are hidden.
+          Consumes the first tap anywhere to reveal controls without triggering playback or underlying buttons */}
+      {!showControls && (
+        <div
+          data-testid="tap-reveal-shield"
+          className="absolute inset-0 z-15 cursor-pointer bg-transparent"
+          onClick={(e) => {
+            e.stopPropagation();
+            revealControls();
+          }}
+        />
+      )}
+
+      {/* Buffering Indicator */}
+      {isBuffering && !playbackError && (
+        <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/40 pointer-events-none">
+          <div className="p-4 rounded-2xl bg-neutral-900/80 backdrop-blur-md border border-neutral-700 shadow-xl flex items-center gap-3 text-white">
+            <Loader2 className="w-6 h-6 animate-spin text-rose-500" />
+            <span className="text-sm font-medium">Buffering video stream...</span>
+          </div>
+        </div>
+      )}
+
+      {/* Playback Error Overlay */}
+      {playbackError && !codecDiagnostic && (
+        <div className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-neutral-950/90 p-6 text-center">
+          <AlertCircle className="w-12 h-12 text-rose-500 mb-3" />
+          <h4 className="text-lg font-bold text-white mb-1">Playback Error</h4>
+          <p className="text-sm text-neutral-400 max-w-md mb-4">{playbackError}</p>
+          <button
+            onClick={() => {
+              setPlaybackError(null);
+              networkRetryCountRef.current = 0;
+              mediaRetryCountRef.current = 0;
+              if (isHlsUrl(effectiveMediaSrc) && isHlsJsSupported() && hlsRef.current) {
+                hlsRef.current.startLoad();
+              } else {
+                videoRef.current?.load();
+              }
+            }}
+            className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white rounded-xl text-xs font-semibold transition"
+          >
+            Retry Video
+          </button>
+        </div>
+      )}
+
+      {/* Apple iOS / Safari Codec Diagnostic Overlay (Black Screen / HEVC hev1 Notice) */}
+      {codecDiagnostic && !isDiagnosticDismissed && (
+        <div className="absolute inset-0 z-35 flex flex-col items-center justify-center bg-black/90 backdrop-blur-md p-4 sm:p-6 text-center animate-in fade-in duration-200">
+          <div className="max-w-md w-full bg-neutral-900 border border-neutral-750 rounded-2xl p-5 shadow-2xl text-left">
+            <div className="flex items-start gap-3 mb-3">
+              <div className="p-2.5 bg-rose-500/15 text-rose-400 rounded-xl shrink-0 mt-0.5">
+                <AlertCircle className="w-5 h-5" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <h4 className="text-sm font-bold text-white leading-snug">{codecDiagnostic.title}</h4>
+                <div className="flex items-center gap-2 mt-1.5 flex-wrap">
+                  <span className="text-[10px] font-mono bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded border border-neutral-700">
+                    Tag: {codecDiagnostic.isHev1 ? "hev1 (HEVC)" : "MP4"}
+                  </span>
+                  {codecDiagnostic.audioPlaying && (
+                    <span className="text-[10px] font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2 py-0.5 rounded flex items-center gap-1">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                      Audio Playing
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <p className="text-xs text-neutral-300 leading-relaxed mb-3">
+              {codecDiagnostic.summary}
+            </p>
+
+            <div className="p-3 bg-neutral-950/90 rounded-xl border border-neutral-800 text-[11px] text-neutral-400 mb-4 space-y-1.5">
+              <p>
+                <strong className="text-neutral-200">Why does this happen?</strong> Apple AVFoundation hardware video decoding on iOS Safari and WebKit requires HEVC streams to carry the <code className="text-rose-400 font-mono">hvc1</code> tag. Android Chrome and desktop VLC accept both <code className="text-neutral-300 font-mono">hev1</code> and <code className="text-neutral-300 font-mono">hvc1</code>.
+              </p>
+              <p>
+                <strong className="text-neutral-200">Recommendation:</strong> {codecDiagnostic.recommendation}
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2 flex-wrap">
+              {codecDiagnostic.audioPlaying && (
+                <button
+                  type="button"
+                  onClick={() => setIsDiagnosticDismissed(true)}
+                  className="flex-1 min-w-[130px] px-3 py-2 bg-neutral-800 hover:bg-neutral-700 text-white text-xs font-semibold rounded-xl transition text-center"
+                >
+                  Listen to Audio Only
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  setCodecDiagnostic(null);
+                  videoRef.current?.load();
+                }}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold rounded-xl transition shadow text-center"
+              >
+                Retry Video
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Top-Left Overlays Container (Series Controls, Lock Notice & Fullscreen Chat Overlay) */}
+      <div
+        className="absolute top-4 left-4 z-40 flex flex-col items-start gap-2 pointer-events-none max-w-[90vw] sm:max-w-md"
+        style={
+          isFullscreen
+            ? {
+                top: "max(1rem, var(--player-cutout-top, 0px))",
+                left: "max(1.25rem, var(--player-cutout-left, 0px))",
+              }
+            : undefined
+        }
+      >
+        {/* Episode / Season Controls for Series (Auto-hides with showControls, shown on interaction) */}
+        {effectiveSeries.isSeries && (
+          <div
+            className={`flex items-center flex-wrap gap-2 transition-opacity duration-300 pointer-events-auto ${
+              showControls ? "opacity-100" : "opacity-0 pointer-events-none"
+            }`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Season Selector (only if multiple seasons exist) */}
+            {effectiveSeries.seasons.length > 1 && (
+              <div className="relative" ref={seasonMenuRef}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    resetControlsTimeout();
+                    if (!canControl) return;
+                    setIsSeasonMenuOpen((prev) => !prev);
+                    setIsEpisodeMenuOpen(false);
+                  }}
+                  disabled={!canControl}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-neutral-900/90 hover:bg-neutral-800 backdrop-blur-md border border-neutral-700/80 text-white text-xs font-semibold shadow-xl transition disabled:opacity-60 disabled:cursor-not-allowed"
+                  title={!canControl ? "Controls locked by host" : "Select Season"}
+                >
+                  <Layers className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                  <span>S{selectedSeasonNum}</span>
+                  <ChevronDown className="w-3 h-3 text-neutral-400 shrink-0" />
+                </button>
+
+                {isSeasonMenuOpen && (
+                  <div className="absolute top-full left-0 mt-1.5 w-36 max-h-56 overflow-y-auto bg-neutral-900/95 border border-neutral-700 rounded-xl shadow-2xl py-1 z-50 backdrop-blur-lg">
+                    {effectiveSeries.seasons.map((s) => (
+                      <button
+                        key={s.seasonNumber}
+                        type="button"
+                        onClick={() => handleSelectSeason(s.seasonNumber)}
+                        className={`w-full text-left px-3 py-1.5 text-xs flex items-center justify-between transition ${
+                          s.seasonNumber === selectedSeasonNum
+                            ? "bg-rose-500/20 text-rose-300 font-bold"
+                            : "text-neutral-200 hover:bg-neutral-800"
+                        }`}
+                      >
+                        <span>{s.label}</span>
+                        {s.seasonNumber === selectedSeasonNum && (
+                          <Check className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Episode Selector */}
+            <div className="relative" ref={episodeMenuRef}>
+              <button
+                type="button"
+                onClick={() => {
+                  resetControlsTimeout();
+                  if (!canControl) return;
+                  setIsEpisodeMenuOpen((prev) => !prev);
+                  setIsSeasonMenuOpen(false);
+                }}
+                disabled={!canControl}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-neutral-900/90 hover:bg-neutral-800 backdrop-blur-md border border-neutral-700/80 text-white text-xs font-semibold shadow-xl transition disabled:opacity-60 disabled:cursor-not-allowed"
+                title={!canControl ? "Controls locked by host" : "Select Episode"}
+              >
+                <Film className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                <span>EP {selectedEpisodeNum}</span>
+                <span className="text-[10px] text-neutral-400 font-normal">
+                  ({currentSeasonEpisodes.length})
+                </span>
+                <ChevronDown className="w-3 h-3 text-neutral-400 shrink-0" />
+              </button>
+
+              {isEpisodeMenuOpen && (
+                <div className="absolute top-full left-0 mt-1.5 w-48 max-h-60 overflow-y-auto bg-neutral-900/95 border border-neutral-700 rounded-xl shadow-2xl py-1 z-50 backdrop-blur-lg">
+                  <div className="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-neutral-400 border-b border-neutral-800">
+                    {effectiveSeries.seasons.length > 1
+                      ? `Season ${selectedSeasonNum} Episodes`
+                      : "Episodes"}
+                  </div>
+                  {currentSeasonEpisodes.map((ep) => (
+                    <button
+                      key={ep.episodeNumber}
+                      type="button"
+                      onClick={() => handleSelectEpisode(ep.episodeNumber)}
+                      className={`w-full text-left px-3 py-2 text-xs flex items-center justify-between transition ${
+                        ep.episodeNumber === selectedEpisodeNum
+                          ? "bg-rose-500/20 text-rose-300 font-bold"
+                          : "text-neutral-200 hover:bg-neutral-800"
+                      }`}
+                    >
+                      <span className="truncate">{ep.label}</span>
+                      {ep.episodeNumber === selectedEpisodeNum && (
+                        <Check className="w-3.5 h-3.5 text-rose-400 shrink-0 ml-2" />
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Control Lock Notice for non-admin */}
+        {!canControl && (
+          <div
+            className={`flex items-center gap-1.5 px-3 py-1 rounded-full bg-neutral-900/85 backdrop-blur-md border border-amber-500/30 text-amber-400 text-xs font-medium shadow-lg transition-opacity duration-300 pointer-events-auto ${
+              showControls ? "opacity-100" : "opacity-0 pointer-events-none"
+            }`}
+          >
+            <Lock className="w-3.5 h-3.5" />
+            <span>Host Locked Playback Controls</span>
+          </div>
+        )}
+
+        {/* Fullscreen Chat Message Overlay */}
+        {isFullscreen && fullscreenChatOverlay && (
+          <div
+            key={fullscreenChatOverlay.id}
+            className="w-full transition-all duration-200"
+          >
+            <div className="flex items-start gap-2.5 px-3.5 py-2 rounded-xl bg-neutral-950/90 border border-neutral-750/90 backdrop-blur-md shadow-2xl text-white">
+              <div className="w-2 h-2 rounded-full bg-rose-500 mt-1.5 shrink-0 animate-pulse" />
+              <div className="min-w-0 flex-1">
+                <p className="text-xs font-bold text-rose-400 truncate">
+                  @{fullscreenChatOverlay.username}
+                </p>
+                <p className="text-xs text-neutral-200 break-words line-clamp-2 mt-0.5 leading-snug">
+                  {fullscreenChatOverlay.text}
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Real-time Sync Indicator (auto-hides after temporary timeout) */}
+      {showSyncIndicator && (
+        <div
+          className="absolute top-4 right-4 z-20 flex items-center gap-1.5 px-3 py-1 rounded-full bg-black/80 backdrop-blur-md border border-emerald-500/40 text-emerald-400 text-[11px] font-mono shadow-md transition-opacity duration-300"
+          style={
+            isFullscreen
+              ? {
+                  top: "max(1rem, var(--player-cutout-top, 0px))",
+                  right: "max(1.25rem, var(--player-cutout-right, 0px))",
+                }
+              : undefined
+          }
+        >
+          <Radio className="w-3 h-3 animate-pulse text-emerald-400" />
+          <span>Sync Active</span>
+        </div>
+      )}
+
+      {/* Centered Large YouTube-Style Controls (only rendered when user can control playback) */}
+      {canControl && (
+        <div
+          className={`absolute inset-0 z-10 flex items-center justify-center gap-6 sm:gap-10 pointer-events-none transition-opacity duration-300 ${
+            showControls ? "opacity-100" : "opacity-0 pointer-events-none"
+          }`}
+        >
+          {/* Left: 10s Back */}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (isRevealTapRecently()) return;
+              seekRelative(-10);
+              resetControlsTimeout();
+            }}
+            className={`w-14 h-14 sm:w-16 sm:h-16 rounded-full bg-neutral-900/85 text-white flex flex-col items-center justify-center border border-neutral-750 shadow-xl transition pointer-events-auto relative hover:bg-rose-600 hover:border-rose-500 cursor-pointer ${
+              showControls ? "opacity-100 scale-100 pointer-events-auto" : "opacity-0 scale-90 pointer-events-none"
+            }`}
+            title="Skip backward 10s"
+          >
+            <RotateCcw className="w-5 h-5 sm:w-6 sm:h-6 mb-1" />
+            <span className="text-[9px] font-bold absolute bottom-2">10</span>
+          </button>
+
+          {/* Center: Play/Pause - ONLY toggles when explicitly clicked */}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (isRevealTapRecently()) return;
+              togglePlayPause();
+              resetControlsTimeout();
+            }}
+            className={`w-18 h-18 sm:w-20 sm:h-20 rounded-full bg-rose-600/90 text-white flex items-center justify-center shadow-2xl backdrop-blur-md transition pointer-events-auto relative hover:bg-rose-500 cursor-pointer ${
+              showControls ? "opacity-100 scale-100 pointer-events-auto" : "opacity-0 scale-90 pointer-events-none"
+            }`}
+            title={isPlaying ? "Pause (Space)" : "Play (Space)"}
+          >
+            {isPlaying ? (
+              <Pause className="w-7 h-7 sm:w-9 sm:h-9 fill-white" />
+            ) : (
+              <Play className="w-7 h-7 sm:w-9 sm:h-9 fill-white ml-1" />
+            )}
+          </button>
+
+          {/* Right: 10s Forward */}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (isRevealTapRecently()) return;
+              seekRelative(10);
+              resetControlsTimeout();
+            }}
+            className={`w-14 h-14 sm:w-16 sm:h-16 rounded-full bg-neutral-900/85 text-white flex flex-col items-center justify-center border border-neutral-750 shadow-xl transition pointer-events-auto relative hover:bg-rose-600 hover:border-rose-500 cursor-pointer ${
+              showControls ? "opacity-100 scale-100 pointer-events-auto" : "opacity-0 scale-90 pointer-events-none"
+            }`}
+            title="Skip forward 10s"
+          >
+            <RotateCw className="w-5 h-5 sm:w-6 sm:h-6 mb-1" />
+            <span className="text-[9px] font-bold absolute bottom-2">10</span>
+          </button>
+        </div>
+      )}
+
+      {/* Video Controls Bar Overlay */}
+      <div
+        className={`absolute inset-x-0 bottom-0 z-20 pt-16 pb-3 px-4 bg-gradient-to-t from-black/95 via-black/60 to-transparent transition-opacity duration-300 ${
+          showControls ? "opacity-100 pointer-events-auto" : "opacity-0 pointer-events-none"
+        }`}
+        style={
+          isFullscreen
+            ? {
+                paddingLeft: "max(1.25rem, var(--player-cutout-left, 0px))",
+                paddingRight: "max(1.25rem, var(--player-cutout-right, 0px))",
+                paddingBottom: "max(0.875rem, var(--player-cutout-bottom, 0px))",
+              }
+            : undefined
+        }
+        onClick={(e) => {
+          e.stopPropagation();
+          resetControlsTimeout();
+        }}
+        onPointerMove={(e) => {
+          if (e.pointerType === "mouse") resetControlsTimeout();
+        }}
+        onMouseMove={resetControlsTimeout}
+      >
+        {/* Scrubber / Progress Bar */}
+        <div className="relative group/scrub mb-2.5">
+          {/* Track background */}
+          <div className="w-full h-1.5 bg-neutral-700/60 rounded-full overflow-hidden relative group-hover/scrub:h-2.5 transition-all">
+            {/* Buffered progress */}
+            <div
+              className="absolute left-0 top-0 bottom-0 bg-neutral-500/50 transition-all duration-200"
+              style={{ width: `${bufferedPercent}%` }}
+            />
+            {/* Played progress */}
+            <div
+              className="absolute left-0 top-0 bottom-0 bg-gradient-to-r from-rose-600 to-rose-500"
+              style={{ width: `${progressPercent}%` }}
+            />
+          </div>
+
+          <input
+            type="range"
+            min={0}
+            max={duration || 1}
+            step={0.1}
+            value={currentTime}
+            disabled={!canControl}
+            onMouseDown={handleSeekStart}
+            onTouchStart={handleSeekStart}
+            onChange={handleSeekChange}
+            onMouseUp={handleSeekEnd}
+            onTouchEnd={handleSeekEnd}
+            className={`absolute inset-0 w-full h-full opacity-0 ${
+              canControl ? "cursor-pointer" : "cursor-not-allowed pointer-events-none"
+            }`}
+          />
+        </div>
+
+        {/* Action Controls Row */}
+        <div className="flex items-center justify-between text-white text-xs gap-2 sm:gap-4">
+          {/* Left: Play, Skip, Volume, Time */}
+          <div className="flex items-center gap-2 sm:gap-3">
+            {canControl && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (isRevealTapRecently()) return;
+                  togglePlayPause();
+                  resetControlsTimeout();
+                }}
+                className="p-1.5 sm:p-2 rounded-lg transition hover:bg-white/15 cursor-pointer text-white"
+                title={isPlaying ? "Pause (Space)" : "Play (Space)"}
+              >
+                {isPlaying ? <Pause className="w-5 h-5 fill-current" /> : <Play className="w-5 h-5 fill-current ml-0.5" />}
+              </button>
+            )}
+
+            {/* Volume */}
+            <div className="flex items-center gap-1.5 group/vol">
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  toggleMute();
+                }}
+                className="p-1.5 rounded-lg hover:bg-white/15 transition text-white"
+                title={isMuted ? "Unmute (M)" : "Mute (M)"}
+              >
+                {isMuted || volume === 0 ? (
+                  <VolumeX className="w-4 h-4 text-rose-400" />
+                ) : (
+                  <Volume2 className="w-4 h-4" />
+                )}
+              </button>
+
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.05}
+                value={isMuted ? 0 : volume}
+                onChange={(e) => {
+                  handleVolumeChange(e);
+                  resetControlsTimeout();
+                }}
+                className="w-14 sm:w-20 h-1 bg-neutral-600 accent-rose-500 rounded-lg cursor-pointer hidden sm:block"
+              />
+            </div>
+
+            {/* Time Display */}
+            <div className="text-[11px] sm:text-xs font-mono text-neutral-300 ml-1">
+              <span>{formatTime(currentTime)}</span>
+              <span className="text-neutral-500 mx-1">/</span>
+              <span>{formatTime(duration)}</span>
+            </div>
+          </div>
+
+          {/* Right: Audio Track, Fullscreen */}
+          <div className="flex items-center gap-2 relative">
+            {/* Audio Track Selector (Available to all users, even if locked) */}
+            {availableAudioTracks.length > 0 && (
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setShowAudioMenu(!showAudioMenu);
+                    setShowQualityMenu(false);
+                    setShowDisplayMenu(false);
+                    resetControlsTimeout();
+                  }}
+                  className={`p-1.5 rounded-lg transition flex items-center gap-1 text-xs ${
+                    showAudioMenu ? "bg-rose-600 text-white" : "hover:bg-white/15 text-neutral-300 hover:text-white"
+                  }`}
+                  title="Select Audio Track"
+                >
+                  <Headphones className="w-4 h-4" />
+                </button>
+
+                {showAudioMenu && (
+                  <div
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      resetControlsTimeout();
+                    }}
+                    className="absolute right-0 bottom-full mb-2 bg-neutral-900 border border-neutral-750 rounded-xl p-1.5 shadow-xl w-44 z-30"
+                  >
+                    <p className="text-[10px] font-semibold uppercase tracking-wider text-neutral-400 px-2 py-1">
+                      Audio Tracks
+                    </p>
+                    {availableAudioTracks.map((tr) => (
+                      <button
+                        key={tr.index}
+                        type="button"
+                        onClick={() => handleAudioTrackSelect(tr.index)}
+                        className={`w-full text-left px-2.5 py-1.5 rounded-lg text-xs flex items-center justify-between transition ${
+                          currentAudioTrack === tr.index ? "bg-rose-600 text-white" : "text-neutral-300 hover:bg-neutral-800"
+                        }`}
+                      >
+                        <span className="truncate">{tr.label}</span>
+                        {currentAudioTrack === tr.index && <Check className="w-3.5 h-3.5 shrink-0" />}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* HLS Video Quality Selector (Hidden for MP4 / offline videos) */}
+            {availableQualities.length > 1 && (
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setShowQualityMenu(!showQualityMenu);
+                    setShowAudioMenu(false);
+                    setShowDisplayMenu(false);
+                    resetControlsTimeout();
+                  }}
+                  className={`p-1.5 rounded-lg transition flex items-center gap-1 text-xs ${
+                    showQualityMenu ? "bg-rose-600 text-white" : "hover:bg-white/15 text-neutral-300 hover:text-white"
+                  }`}
+                  title={`Video Quality (${
+                    selectedQuality === -1
+                      ? currentQualityHeight
+                        ? `Auto: ${currentQualityHeight}p`
+                        : "Auto"
+                      : availableQualities.find((q) => q.id === selectedQuality)?.label || "Auto"
+                  })`}
+                >
+                  <Settings className="w-4 h-4" />
+                  <span className="hidden sm:inline text-[10px] font-semibold">
+                    {selectedQuality === -1
+                      ? currentQualityHeight
+                        ? `${currentQualityHeight}p`
+                        : "Auto"
+                      : availableQualities.find((q) => q.id === selectedQuality)?.label || "Auto"}
+                  </span>
+                </button>
+
+                {showQualityMenu && (
+                  <div
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      resetControlsTimeout();
+                    }}
+                    className="absolute right-0 bottom-full mb-2 bg-neutral-900 border border-neutral-750 rounded-xl p-1.5 shadow-xl w-36 z-30 flex flex-col gap-0.5 animate-in fade-in slide-in-from-bottom-2 duration-150"
+                  >
+                    <p className="text-[10px] font-semibold uppercase tracking-wider text-neutral-400 px-2 py-1">
+                      Quality
+                    </p>
+                    {availableQualities.map((q) => (
+                      <button
+                        key={q.id}
+                        type="button"
+                        onClick={() => handleQualitySelect(q.id)}
+                        className={`w-full text-left px-2.5 py-1.5 rounded-lg text-xs flex items-center justify-between transition ${
+                          selectedQuality === q.id ? "bg-rose-600 text-white" : "text-neutral-300 hover:bg-neutral-800"
+                        }`}
+                      >
+                        <span className="truncate">
+                          {q.id === -1 && currentQualityHeight
+                            ? `Auto (${currentQualityHeight}p)`
+                            : q.label}
+                        </span>
+                        {selectedQuality === q.id && <Check className="w-3.5 h-3.5 shrink-0" />}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Subtitle / CC Control */}
+            {hasCurrentSubtitle && (
+              <button
+                type="button"
+                onClick={handleToggleSubtitles}
+                className={`p-1.5 rounded-lg transition flex items-center justify-center text-xs ${
+                  isSubtitlesEnabled
+                    ? "bg-rose-600 text-white shadow-sm"
+                    : "hover:bg-white/15 text-neutral-400 hover:text-white"
+                }`}
+                aria-label="Toggle subtitles"
+                title={isSubtitlesEnabled ? "Disable Subtitles (CC)" : "Enable Subtitles (CC)"}
+              >
+                <Subtitles className="w-4 h-4" />
+              </button>
+            )}
+
+            {/* Display Scale Mode Control */}
+            <div className="relative">
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setShowDisplayMenu(!showDisplayMenu);
+                  setShowAudioMenu(false);
+                  setShowQualityMenu(false);
+                  resetControlsTimeout();
+                }}
+                className={`p-1.5 rounded-lg transition flex items-center justify-center text-xs ${
+                  showDisplayMenu ? "bg-rose-600 text-white" : "hover:bg-white/15 text-neutral-300 hover:text-white"
+                }`}
+                aria-label={`Change display scale mode (Current: ${displayMode})`}
+                title={`Display Scale: ${displayMode}`}
+              >
+                <Crop className="w-4 h-4" />
+              </button>
+              {showDisplayMenu && (
+                <div
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    resetControlsTimeout();
+                  }}
+                  className="absolute right-0 bottom-full mb-2 bg-neutral-900 border border-neutral-750 rounded-xl p-1.5 shadow-xl w-32 z-30 flex flex-col gap-0.5 animate-in fade-in slide-in-from-bottom-2 duration-150"
+                >
+                  <p className="text-[10px] font-semibold uppercase tracking-wider text-neutral-400 px-2 py-1">
+                    Scale Mode
+                  </p>
+                  {(["fit", "zoom", "stretch"] as const).map((mode) => (
+                    <button
+                      key={mode}
+                      type="button"
+                      onClick={() => {
+                        setDisplayMode(mode);
+                        setShowDisplayMenu(false);
+                      }}
+                      className={`w-full text-left px-2.5 py-1.5 rounded-lg text-xs flex items-center justify-between transition capitalize ${
+                        displayMode === mode ? "bg-rose-600 text-white font-semibold" : "text-neutral-300 hover:bg-neutral-800"
+                      }`}
+                    >
+                      <span>{mode}</span>
+                      {displayMode === mode && <Check className="w-3.5 h-3.5 shrink-0" />}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Fullscreen Button (Available to all users, even if locked) */}
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                toggleFullscreen();
+                resetControlsTimeout();
+              }}
+              className="p-1.5 rounded-lg hover:bg-white/15 transition text-white"
+              title={isFullscreen ? "Exit Fullscreen (F)" : "Fullscreen (F)"}
+            >
+              {isFullscreen ? <Minimize className="w-4 h-4" /> : <Maximize className="w-4 h-4" />}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export const VideoPlayer = React.memo(VideoPlayerComponent);
