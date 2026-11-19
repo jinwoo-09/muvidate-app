@@ -5,6 +5,7 @@ import { Network } from "@capacitor/network";
 import { ScreenOrientation } from "@capacitor/screen-orientation";
 import { StatusBar, Style } from "@capacitor/status-bar";
 import { SplashScreen } from "@capacitor/splash-screen";
+import { Keyboard } from "@capacitor/keyboard";
 
 interface AndroidBridgeInterface {
   setKeepScreenOn?: (keepOn: boolean) => void;
@@ -20,6 +21,10 @@ declare global {
 
 export function isNativeAndroid(): boolean {
   return Capacitor.isNativePlatform() && Capacitor.getPlatform() === "android";
+}
+
+if (typeof document !== "undefined" && isNativeAndroid()) {
+  document.documentElement.dataset.nativeAndroid = "true";
 }
 
 export function isNativeApp(): boolean {
@@ -98,7 +103,6 @@ export async function configureNativeSystemBars(): Promise<void> {
     await ScreenOrientation.lock({ orientation: "portrait" }).catch(() => {});
     await StatusBar.setStyle({ style: Style.Dark });
     await StatusBar.setOverlaysWebView({ overlay: true });
-    await StatusBar.setBackgroundColor({ color: "#0a0a0a" });
   } catch {
     // Safe fallback
   }
@@ -151,7 +155,6 @@ export async function exitNativeFullscreen(): Promise<void> {
     await StatusBar.show().catch(() => {});
     await StatusBar.setStyle({ style: Style.Dark }).catch(() => {});
     await StatusBar.setOverlaysWebView({ overlay: true }).catch(() => {});
-    await StatusBar.setBackgroundColor({ color: "#0a0a0a" }).catch(() => {});
   } catch {
     // Safe fallback
   }
@@ -240,4 +243,45 @@ export async function exitNativeApp(): Promise<void> {
   } catch {
     // Safe fallback
   }
+}
+
+/**
+ * Subscribes to native Android soft-keyboard show/hide events with clean teardown.
+ */
+export function subscribeToKeyboardState(
+  onChange: (state: { isOpen: boolean; height: number }) => void
+): () => void {
+  if (!isNativeAndroid()) return () => {};
+  let active = true;
+  const handles: Array<{ remove: () => Promise<void> }> = [];
+
+  const add = async (
+    eventName: "keyboardWillShow" | "keyboardDidShow" | "keyboardWillHide" | "keyboardDidHide",
+    isOpen: boolean
+  ) => {
+    try {
+      const handle = await Keyboard.addListener(eventName as any, (info: any) => {
+        if (!active) return;
+        const height = typeof info?.keyboardHeight === "number" ? info.keyboardHeight : 0;
+        onChange({ isOpen, height });
+      });
+      if (active) {
+        handles.push(handle);
+      } else {
+        handle.remove().catch(() => {});
+      }
+    } catch {
+      // Safe fallback
+    }
+  };
+
+  add("keyboardWillShow", true);
+  add("keyboardDidShow", true);
+  add("keyboardWillHide", false);
+  add("keyboardDidHide", false);
+
+  return () => {
+    active = false;
+    handles.forEach((h) => h.remove().catch(() => {}));
+  };
 }

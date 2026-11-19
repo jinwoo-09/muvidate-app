@@ -74,8 +74,14 @@ export function UsernameSetupModal() {
   const initials = username.trim() ? username.trim().slice(0, 2).toUpperCase() : "MD";
 
   return (
-    <div className="fixed inset-0 z-[20000] flex items-center justify-center p-3 sm:p-4 bg-black/92 overflow-y-auto w-full h-full">
-      <div className="w-full max-w-md max-h-[85dvh] overflow-y-auto bg-neutral-900 border border-neutral-800 rounded-3xl shadow-2xl p-5 sm:p-7 relative my-auto no-scrollbar">
+    <div
+      className="fixed inset-0 z-[20000] flex items-center justify-center p-3 sm:p-4 bg-black/92 overflow-y-auto overscroll-contain w-full h-full"
+      style={{ paddingBottom: "calc(0.75rem + var(--native-keyboard-height, 0px))" }}
+    >
+      <div
+        className="w-full max-w-md overflow-y-auto overscroll-contain bg-neutral-900 border border-neutral-800 rounded-3xl shadow-2xl p-5 sm:p-7 relative my-auto no-scrollbar"
+        style={{ maxHeight: "calc(100dvh - 1.5rem - var(--native-keyboard-height, 0px))" }}
+      >
         {/* Ambient glow accent */}
         <div className="absolute -top-20 -right-20 w-44 h-44 bg-rose-500/15 rounded-full blur-3xl pointer-events-none" />
         <div className="absolute -bottom-20 -left-20 w-44 h-44 bg-amber-500/10 rounded-full blur-3xl pointer-events-none" />

@@ -140,8 +140,14 @@ export function ProfileModal({ isOpen, onClose }: ProfileModalProps) {
   const initials = profile.username ? profile.username.slice(0, 2).toUpperCase() : "MD";
 
   return (
-    <div className="fixed inset-0 z-[20000] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200 overflow-y-auto">
-      <div className="w-full max-w-md max-h-[90dvh] overflow-y-auto bg-neutral-900 border border-neutral-800 rounded-3xl p-6 shadow-2xl relative my-auto">
+    <div
+      className="fixed inset-0 z-[20000] flex items-center justify-center p-4 bg-black/85 animate-in fade-in duration-200 overflow-y-auto overscroll-contain"
+      style={{ paddingBottom: "calc(1rem + var(--native-keyboard-height, 0px))" }}
+    >
+      <div
+        className="w-full max-w-md overflow-y-auto overscroll-contain bg-neutral-900 border border-neutral-800 rounded-3xl p-6 shadow-2xl relative my-auto"
+        style={{ maxHeight: "calc(100dvh - 2rem - var(--native-keyboard-height, 0px))" }}
+      >
         <button
           onClick={onClose}
           className="absolute top-4 right-4 p-2 text-neutral-400 hover:text-white rounded-lg hover:bg-neutral-800 transition"

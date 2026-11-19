@@ -42,7 +42,7 @@ export function MovieCard({
         )}
 
         {/* Year badge */}
-        <div className="absolute top-2.5 right-2.5 px-2 py-0.5 rounded-md bg-neutral-950/80 backdrop-blur-md text-[10px] font-mono text-neutral-300 border border-neutral-800">
+        <div className="absolute top-2.5 right-2.5 px-2 py-0.5 rounded-md bg-neutral-950/90 text-[10px] font-mono text-neutral-300 border border-neutral-800">
           {movie.year}
         </div>
 

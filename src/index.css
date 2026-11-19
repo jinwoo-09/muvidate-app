@@ -52,6 +52,13 @@
   }
 }
 
+html[data-native-android="true"]:not([data-video-fullscreen="true"]) {
+  --app-safe-top: 0px;
+  --app-safe-right: 0px;
+  --app-safe-bottom: 0px;
+  --app-safe-left: 0px;
+}
+
 .app-safe-shell {
   padding-top: var(--app-safe-top);
   padding-right: var(--app-safe-right);
@@ -73,6 +80,18 @@ html[data-video-fullscreen="true"] .app-safe-shell {
 
 html[data-video-fullscreen="true"] .native-status-bar-shield {
   display: none !important;
+}
+
+html[data-watch-keyboard-open="true"] body,
+html[data-watch-keyboard-open="true"] #root {
+  overflow-y: hidden !important;
+  height: 100% !important;
+}
+
+html[data-watch-keyboard-open="true"] .app-root-container {
+  height: 100% !important;
+  min-height: 0 !important;
+  overflow: hidden !important;
 }
 
 :fullscreen,

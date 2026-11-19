@@ -14,6 +14,7 @@ import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebSettings
 import android.widget.FrameLayout
+import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -21,6 +22,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import com.getcapacitor.BridgeActivity
 import com.getcapacitor.BridgeWebChromeClient
 import java.util.Locale
+import kotlin.math.max
 import kotlin.math.roundToInt
 
 class MainActivity : BridgeActivity() {
@@ -33,8 +35,12 @@ class MainActivity : BridgeActivity() {
     super.onCreate(savedInstanceState)
 
     WindowCompat.setDecorFitsSystemWindows(window, false)
-    window.statusBarColor = Color.parseColor("#0A0A0A")
-    window.navigationBarColor = Color.parseColor("#0A0A0A")
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+      @Suppress("DEPRECATION")
+      window.statusBarColor = Color.parseColor("#0A0A0A")
+      @Suppress("DEPRECATION")
+      window.navigationBarColor = Color.parseColor("#0A0A0A")
+    }
 
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
       val lp = window.attributes
@@ -52,13 +58,43 @@ class MainActivity : BridgeActivity() {
 
     val decorView = window.decorView
     decorView.setBackgroundColor(Color.parseColor("#0A0A0A"))
-    decorView.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+
+    ViewCompat.setOnApplyWindowInsetsListener(decorView) { v, insets ->
+      val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+      val cutout = insets.getInsets(WindowInsetsCompat.Type.displayCutout())
+      val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+      val keyboardVisible = insets.isVisible(WindowInsetsCompat.Type.ime())
+
       if (isVideoFullscreen) {
         if (v.paddingLeft != 0 || v.paddingTop != 0 || v.paddingRight != 0 || v.paddingBottom != 0) {
           v.setPadding(0, 0, 0, 0)
         }
-        updateFullscreenCutoutCss()
+        updateSafeAreaCssZero()
+        updateFullscreenCutoutCssFromInsets(
+          insets.getInsetsIgnoringVisibility(WindowInsetsCompat.Type.displayCutout())
+        )
+      } else {
+        val topPadding = max(systemBars.top, cutout.top)
+        val leftPadding = max(systemBars.left, cutout.left)
+        val rightPadding = max(systemBars.right, cutout.right)
+        val bottomPadding = if (keyboardVisible) ime.bottom else max(systemBars.bottom, cutout.bottom)
+
+        if (v.paddingLeft != leftPadding || v.paddingTop != topPadding ||
+          v.paddingRight != rightPadding || v.paddingBottom != bottomPadding
+        ) {
+          v.setPadding(leftPadding, topPadding, rightPadding, bottomPadding)
+        }
+        updateSafeAreaCssZero()
       }
+
+      WindowInsetsCompat.Builder(insets)
+        .setInsets(
+          WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
+          Insets.NONE
+        )
+        .setInsets(WindowInsetsCompat.Type.ime(), Insets.NONE)
+        .setVisible(WindowInsetsCompat.Type.ime(), false)
+        .build()
     }
 
     bridge?.webView?.let { webView ->
@@ -125,6 +161,8 @@ class MainActivity : BridgeActivity() {
         }
       }
     }
+
+    ViewCompat.requestApplyInsets(decorView)
   }
 
   override fun onResume() {
@@ -140,6 +178,8 @@ class MainActivity : BridgeActivity() {
     super.onConfigurationChanged(newConfig)
     if (isVideoFullscreen) {
       window.decorView.post { updateFullscreenCutoutCss() }
+    } else {
+      ViewCompat.requestApplyInsets(window.decorView)
     }
   }
 
@@ -183,11 +223,26 @@ class MainActivity : BridgeActivity() {
     }
   }
 
-  private fun updateFullscreenCutoutCss() {
+  private fun updateSafeAreaCssZero() {
     val webView = bridge?.webView ?: return
+    val script =
+      "try{const s=document.documentElement.style;s.setProperty('--safe-area-inset-top','0px');s.setProperty('--safe-area-inset-right','0px');s.setProperty('--safe-area-inset-bottom','0px');s.setProperty('--safe-area-inset-left','0px');}catch(e){}"
+    webView.post {
+      bridge?.webView?.evaluateJavascript(script, null)
+    }
+  }
+
+  private fun updateFullscreenCutoutCss() {
     if (!isVideoFullscreen) return
     val rootInsets = ViewCompat.getRootWindowInsets(window.decorView) ?: return
-    val cutout = rootInsets.getInsetsIgnoringVisibility(WindowInsetsCompat.Type.displayCutout())
+    updateFullscreenCutoutCssFromInsets(
+      rootInsets.getInsetsIgnoringVisibility(WindowInsetsCompat.Type.displayCutout())
+    )
+  }
+
+  private fun updateFullscreenCutoutCssFromInsets(cutout: Insets) {
+    val webView = bridge?.webView ?: return
+    if (!isVideoFullscreen) return
     val density = resources.displayMetrics.density.let { if (it > 0f) it else 1f }
 
     val topPx = (cutout.top / density).roundToInt()
@@ -200,14 +255,18 @@ class MainActivity : BridgeActivity() {
       "try{const s=document.documentElement.style;s.setProperty('--cutout-inset-top','%dpx');s.setProperty('--cutout-inset-right','%dpx');s.setProperty('--cutout-inset-bottom','%dpx');s.setProperty('--cutout-inset-left','%dpx');}catch(e){}",
       topPx, rightPx, bottomPx, leftPx
     )
-    webView.evaluateJavascript(script, null)
+    webView.post {
+      bridge?.webView?.evaluateJavascript(script, null)
+    }
   }
 
   private fun clearFullscreenCutoutCss() {
     val webView = bridge?.webView ?: return
     val script =
       "try{const s=document.documentElement.style;s.removeProperty('--cutout-inset-top');s.removeProperty('--cutout-inset-right');s.removeProperty('--cutout-inset-bottom');s.removeProperty('--cutout-inset-left');}catch(e){}"
-    webView.evaluateJavascript(script, null)
+    webView.post {
+      bridge?.webView?.evaluateJavascript(script, null)
+    }
   }
 
   private inner class MuviDateNativeBridge {

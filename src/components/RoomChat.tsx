@@ -3,6 +3,7 @@ import { useAuth } from "../context/AuthContext";
 import { rtdb, getUserProfile } from "../lib/firebase";
 import { ref, onValue, off, push, set, update } from "firebase/database";
 import { ChatMessage } from "../types";
+import { isNativeAndroid } from "../lib/nativeBridge";
 import { Send, MessageSquare, Shield, X } from "lucide-react";
 
 // In-memory cache for user avatars across the app session to avoid redundant Firestore queries
@@ -13,12 +14,16 @@ interface RoomChatProps {
   roomCode: string;
   adminUid: string;
   isMovieCompleted: boolean;
+  isCompactKeyboard?: boolean;
+  onInputFocusChange?: (focused: boolean) => void;
 }
 
 export function RoomChat({ 
   roomCode, 
   adminUid, 
-  isMovieCompleted
+  isMovieCompleted,
+  isCompactKeyboard = false,
+  onInputFocusChange
 }: RoomChatProps) {
   const { user, profile } = useAuth();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -109,10 +114,14 @@ export function RoomChat({
     if (messagesContainerRef.current) {
       messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
     }
-  }, [messages]);
+  }, [messages, isCompactKeyboard]);
 
-  // Visual viewport tracking for mobile virtual keyboards (iOS Safari and Android Chrome)
+  // Visual viewport tracking only for mobile web browsers (native Android handles IME bottom inset via decorView)
   useEffect(() => {
+    if (isNativeAndroid() || isCompactKeyboard) {
+      setKeyboardOffset(0);
+      return;
+    }
     if (typeof window === "undefined" || !window.visualViewport) return;
 
     const handleVisualViewport = () => {
@@ -123,7 +132,6 @@ export function RoomChat({
       const visualHeight = vv.height;
       const offset = Math.max(0, layoutHeight - (visualHeight + (vv.offsetTop || 0)));
 
-      // If the keyboard is open (offset > 40px), track offset so input sits above it
       setKeyboardOffset(offset > 40 ? offset : 0);
 
       if (document.activeElement === chatInputRef.current) {
@@ -143,14 +151,24 @@ export function RoomChat({
       vv.removeEventListener("resize", handleVisualViewport);
       vv.removeEventListener("scroll", handleVisualViewport);
     };
-  }, []);
+  }, [isCompactKeyboard]);
 
   const handleInputFocus = () => {
+    onInputFocusChange?.(true);
+    requestAnimationFrame(() => {
+      if (messagesContainerRef.current) {
+        messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
+      }
+    });
     setTimeout(() => {
       if (messagesContainerRef.current) {
         messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
       }
-    }, 200);
+    }, 180);
+  };
+
+  const handleInputBlur = () => {
+    onInputFocusChange?.(false);
   };
 
   const handleSendMessage = async (e: React.FormEvent) => {
@@ -196,12 +214,20 @@ export function RoomChat({
   };
 
   return (
-    <div className="flex flex-col h-full bg-neutral-900/90 border border-neutral-800 rounded-2xl overflow-hidden backdrop-blur-sm">
+    <div className="flex flex-col h-full bg-neutral-900/95 border border-neutral-800 rounded-2xl overflow-hidden">
       {/* Header */}
-      <div className="px-4 py-3 border-b border-neutral-800 bg-neutral-900/90 flex items-center justify-between">
+      <div
+        className={
+          isCompactKeyboard
+            ? "px-3 py-1.5 border-b border-neutral-800 bg-neutral-900 flex items-center justify-between shrink-0"
+            : "px-4 py-3 border-b border-neutral-800 bg-neutral-900/90 flex items-center justify-between shrink-0"
+        }
+      >
         <div className="flex items-center gap-2">
-          <MessageSquare className="w-4 h-4 text-rose-500" />
-          <h4 className="text-sm font-bold text-white tracking-wide">Live Room Chat</h4>
+          <MessageSquare className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-rose-500" />
+          <h4 className={isCompactKeyboard ? "text-xs font-bold text-white tracking-wide" : "text-sm font-bold text-white tracking-wide"}>
+            Live Room Chat
+          </h4>
         </div>
         <span className="text-[11px] text-neutral-400 bg-neutral-800/80 px-2 py-0.5 rounded-full">
           {messages.length} messages
@@ -211,7 +237,7 @@ export function RoomChat({
       {/* Messages List */}
       <div 
         ref={messagesContainerRef}
-        className="flex-1 overflow-y-auto p-3 sm:p-4 space-y-3.5 min-h-[160px] overscroll-contain"
+        className="flex-1 min-h-0 overflow-y-auto p-3 sm:p-4 space-y-3 overscroll-contain"
         style={{ WebkitOverflowScrolling: "touch" }}
       >
         {isMovieCompleted ? (
@@ -313,12 +339,21 @@ export function RoomChat({
 
       {/* Message Input */}
       <div 
-        className="p-2.5 sm:p-3 border-t border-neutral-800 bg-neutral-950/95 transition-all duration-150"
-        style={{
-          paddingBottom: keyboardOffset > 0 
-            ? `${keyboardOffset + 8}px` 
-            : "max(0.625rem, env(safe-area-inset-bottom, 0px))"
-        }}
+        className={
+          isCompactKeyboard
+            ? "p-2 border-t border-neutral-800 bg-neutral-950 shrink-0"
+            : "p-2.5 sm:p-3 border-t border-neutral-800 bg-neutral-950/95 shrink-0 transition-all duration-150"
+        }
+        style={
+          isNativeAndroid() || isCompactKeyboard
+            ? undefined
+            : {
+                paddingBottom:
+                  keyboardOffset > 0
+                    ? `${keyboardOffset + 8}px`
+                    : "max(0.625rem, env(safe-area-inset-bottom, 0px))"
+              }
+        }
       >
         {isMovieCompleted ? (
           <p className="text-center text-xs text-neutral-500 py-1">
@@ -337,6 +372,7 @@ export function RoomChat({
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
               onFocus={handleInputFocus}
+              onBlur={handleInputBlur}
               placeholder="Type a message..."
               disabled={isMovieCompleted}
               className="flex-1 px-3 py-2 bg-neutral-900 border border-neutral-750 rounded-xl text-base sm:text-xs text-white placeholder-neutral-500 focus:outline-none focus:ring-1 focus:ring-rose-500 transition"
@@ -344,8 +380,9 @@ export function RoomChat({
 
             <button
               type="submit"
+              onMouseDown={(e) => e.preventDefault()}
               disabled={!inputText.trim() || isSending || isMovieCompleted}
-              className="p-2.5 bg-rose-600 hover:bg-rose-500 text-white rounded-xl transition disabled:opacity-40 shadow-sm"
+              className="p-2.5 bg-rose-600 hover:bg-rose-500 text-white rounded-xl transition disabled:opacity-40 shadow-sm shrink-0"
               title="Send message"
             >
               <Send className="w-4 h-4" />

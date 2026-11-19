@@ -294,9 +294,13 @@ export function UploadMovieModal({
   return (
     <div
       ref={modalScrollRef}
-      className="fixed inset-0 z-[20000] overflow-y-auto bg-black/85 backdrop-blur-md p-3 sm:p-6 flex items-start justify-center"
+      className="fixed inset-0 z-[20000] overflow-y-auto overscroll-contain bg-black/85 p-3 sm:p-6 flex items-start justify-center"
+      style={{ paddingBottom: "calc(0.75rem + var(--native-keyboard-height, 0px))" }}
     >
-      <div className="w-full max-w-2xl bg-neutral-900 border border-neutral-800 rounded-2xl p-4 sm:p-8 shadow-2xl relative my-4 sm:my-8 shrink-0">
+      <div
+        className="w-full max-w-2xl overflow-y-auto overscroll-contain bg-neutral-900 border border-neutral-800 rounded-2xl p-4 sm:p-8 shadow-2xl relative my-2 sm:my-6 shrink-0"
+        style={{ maxHeight: "calc(100dvh - 1.5rem - var(--native-keyboard-height, 0px))" }}
+      >
         <button
           onClick={onClose}
           disabled={isSaving}

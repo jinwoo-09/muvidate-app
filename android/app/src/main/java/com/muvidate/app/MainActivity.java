@@ -42,8 +42,10 @@ public class MainActivity extends BridgeActivity {
 
         Window window = getWindow();
         WindowCompat.setDecorFitsSystemWindows(window, false);
-        window.setStatusBarColor(Color.parseColor("#0A0A0A"));
-        window.setNavigationBarColor(Color.parseColor("#0A0A0A"));
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+            window.setStatusBarColor(Color.parseColor("#0A0A0A"));
+            window.setNavigationBarColor(Color.parseColor("#0A0A0A"));
+        }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             WindowManager.LayoutParams lp = window.getAttributes();
@@ -63,14 +65,50 @@ public class MainActivity extends BridgeActivity {
 
         final View decorView = window.getDecorView();
         decorView.setBackgroundColor(Color.parseColor("#0A0A0A"));
-        decorView.addOnLayoutChangeListener((v, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) -> {
+
+        // Manage all portrait system-bar + IME insets natively on decorView so WebView
+        // always starts directly below the status bar with zero duplicate CSS top gap,
+        // and smoothly resizes above the soft keyboard while fullscreen video fills edge-to-edge.
+        ViewCompat.setOnApplyWindowInsetsListener(decorView, (v, insets) -> {
+            Insets systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars());
+            Insets cutout = insets.getInsets(WindowInsetsCompat.Type.displayCutout());
+            Insets ime = insets.getInsets(WindowInsetsCompat.Type.ime());
+            boolean keyboardVisible = insets.isVisible(WindowInsetsCompat.Type.ime());
+
             if (isVideoFullscreen) {
                 if (v.getPaddingLeft() != 0 || v.getPaddingTop() != 0
                         || v.getPaddingRight() != 0 || v.getPaddingBottom() != 0) {
                     v.setPadding(0, 0, 0, 0);
                 }
-                updateFullscreenCutoutCss();
+                updateSafeAreaCssZero();
+                updateFullscreenCutoutCssFromInsets(
+                        insets.getInsetsIgnoringVisibility(WindowInsetsCompat.Type.displayCutout())
+                );
+            } else {
+                int topPadding = Math.max(systemBars.top, cutout.top);
+                int leftPadding = Math.max(systemBars.left, cutout.left);
+                int rightPadding = Math.max(systemBars.right, cutout.right);
+                int bottomPadding = keyboardVisible
+                        ? ime.bottom
+                        : Math.max(systemBars.bottom, cutout.bottom);
+
+                if (v.getPaddingLeft() != leftPadding || v.getPaddingTop() != topPadding
+                        || v.getPaddingRight() != rightPadding || v.getPaddingBottom() != bottomPadding) {
+                    v.setPadding(leftPadding, topPadding, rightPadding, bottomPadding);
+                }
+                updateSafeAreaCssZero();
             }
+
+            // Clear systemBars, displayCutout, and ime insets passed to the WebView so Chromium
+            // neither adds duplicate CSS safe-area offsets nor double-resizes on keyboard open.
+            return new WindowInsetsCompat.Builder(insets)
+                    .setInsets(
+                            WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout(),
+                            Insets.NONE
+                    )
+                    .setInsets(WindowInsetsCompat.Type.ime(), Insets.NONE)
+                    .setVisible(WindowInsetsCompat.Type.ime(), false)
+                    .build();
         });
 
         if (getBridge() != null && getBridge().getWebView() != null) {
@@ -146,6 +184,8 @@ public class MainActivity extends BridgeActivity {
                 }
             });
         }
+
+        ViewCompat.requestApplyInsets(decorView);
     }
 
     @Override
@@ -163,6 +203,8 @@ public class MainActivity extends BridgeActivity {
         super.onConfigurationChanged(newConfig);
         if (isVideoFullscreen) {
             getWindow().getDecorView().post(this::updateFullscreenCutoutCss);
+        } else {
+            ViewCompat.requestApplyInsets(getWindow().getDecorView());
         }
     }
 
@@ -214,6 +256,18 @@ public class MainActivity extends BridgeActivity {
         }
     }
 
+    private void updateSafeAreaCssZero() {
+        if (getBridge() == null || getBridge().getWebView() == null) {
+            return;
+        }
+        String script = "try{const s=document.documentElement.style;s.setProperty('--safe-area-inset-top','0px');s.setProperty('--safe-area-inset-right','0px');s.setProperty('--safe-area-inset-bottom','0px');s.setProperty('--safe-area-inset-left','0px');}catch(e){}";
+        getBridge().getWebView().post(() -> {
+            if (getBridge() != null && getBridge().getWebView() != null) {
+                getBridge().getWebView().evaluateJavascript(script, null);
+            }
+        });
+    }
+
     private void updateFullscreenCutoutCss() {
         if (!isVideoFullscreen || getBridge() == null || getBridge().getWebView() == null) {
             return;
@@ -222,7 +276,15 @@ public class MainActivity extends BridgeActivity {
         if (rootInsets == null) {
             return;
         }
-        Insets cutout = rootInsets.getInsetsIgnoringVisibility(WindowInsetsCompat.Type.displayCutout());
+        updateFullscreenCutoutCssFromInsets(
+                rootInsets.getInsetsIgnoringVisibility(WindowInsetsCompat.Type.displayCutout())
+        );
+    }
+
+    private void updateFullscreenCutoutCssFromInsets(Insets cutout) {
+        if (!isVideoFullscreen || getBridge() == null || getBridge().getWebView() == null || cutout == null) {
+            return;
+        }
         float density = getResources().getDisplayMetrics().density;
         if (density <= 0f) density = 1f;
 
@@ -236,7 +298,11 @@ public class MainActivity extends BridgeActivity {
                 "try{const s=document.documentElement.style;s.setProperty('--cutout-inset-top','%dpx');s.setProperty('--cutout-inset-right','%dpx');s.setProperty('--cutout-inset-bottom','%dpx');s.setProperty('--cutout-inset-left','%dpx');}catch(e){}",
                 topPx, rightPx, bottomPx, leftPx
         );
-        getBridge().getWebView().evaluateJavascript(script, null);
+        getBridge().getWebView().post(() -> {
+            if (getBridge() != null && getBridge().getWebView() != null) {
+                getBridge().getWebView().evaluateJavascript(script, null);
+            }
+        });
     }
 
     private void clearFullscreenCutoutCss() {
@@ -244,7 +310,11 @@ public class MainActivity extends BridgeActivity {
             return;
         }
         String script = "try{const s=document.documentElement.style;s.removeProperty('--cutout-inset-top');s.removeProperty('--cutout-inset-right');s.removeProperty('--cutout-inset-bottom');s.removeProperty('--cutout-inset-left');}catch(e){}";
-        getBridge().getWebView().evaluateJavascript(script, null);
+        getBridge().getWebView().post(() -> {
+            if (getBridge() != null && getBridge().getWebView() != null) {
+                getBridge().getWebView().evaluateJavascript(script, null);
+            }
+        });
     }
 
     private class MuviDateNativeBridge {

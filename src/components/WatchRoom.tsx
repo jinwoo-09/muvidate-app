@@ -8,7 +8,7 @@ import { VideoPlayer } from "./VideoPlayer";
 import { RoomChat } from "./RoomChat";
 import { ChangeMediaModal } from "./ChangeMediaModal";
 import { SeriesStructure, extractSeriesStructure, getEpisodeUrl } from "../lib/seriesUtils";
-import { getShareableRoomUrl } from "../lib/nativeBridge";
+import { getShareableRoomUrl, isNativeAndroid, subscribeToKeyboardState } from "../lib/nativeBridge";
 import { 
   Copy, 
   Check, 
@@ -65,6 +65,107 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
   const [activeTab, setActiveTab] = useState<"chat" | "participants">("chat");
   const [showParticipantsMobile, setShowParticipantsMobile] = useState(false);
   const [isChangeMediaOpen, setIsChangeMediaOpen] = useState(false);
+
+  const [isSmallViewport, setIsSmallViewport] = useState<boolean>(() =>
+    typeof window !== "undefined" ? window.innerWidth < 1024 : true
+  );
+  const [isKeyboardOpen, setIsKeyboardOpen] = useState(false);
+  const [isChatSessionActive, setIsChatSessionActive] = useState(false);
+  const [isFullscreenActive, setIsFullscreenActive] = useState(false);
+  const isKeyboardOpenRef = useRef(false);
+  isKeyboardOpenRef.current = isKeyboardOpen;
+  const baseViewportHeightRef = useRef<number>(
+    typeof window !== "undefined" ? window.innerHeight : 0
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleResize = () => {
+      const small = window.innerWidth < 1024;
+      setIsSmallViewport(small);
+      if (!isKeyboardOpenRef.current && window.innerHeight > baseViewportHeightRef.current) {
+        baseViewportHeightRef.current = window.innerHeight;
+      }
+    };
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const handleFsChange = () => {
+      const fs = Boolean(
+        document.fullscreenElement ||
+          (document as any).webkitFullscreenElement ||
+          (document as any).mozFullScreenElement ||
+          document.documentElement.dataset.videoFullscreen === "true"
+      );
+      setIsFullscreenActive(fs);
+      if (fs) {
+        setIsChatSessionActive(false);
+      }
+    };
+    document.addEventListener("fullscreenchange", handleFsChange);
+    document.addEventListener("webkitfullscreenchange", handleFsChange);
+    document.addEventListener("mozfullscreenchange", handleFsChange);
+    return () => {
+      document.removeEventListener("fullscreenchange", handleFsChange);
+      document.removeEventListener("webkitfullscreenchange", handleFsChange);
+      document.removeEventListener("mozfullscreenchange", handleFsChange);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (isNativeAndroid()) {
+      return subscribeToKeyboardState(({ isOpen }) => {
+        setIsKeyboardOpen(isOpen);
+        if (!isOpen) {
+          setIsChatSessionActive(false);
+        }
+      });
+    }
+
+    if (typeof window === "undefined") return;
+    const vv = window.visualViewport;
+    const checkWebKeyboard = () => {
+      const currentHeight = vv ? vv.height : window.innerHeight;
+      if (currentHeight > baseViewportHeightRef.current) {
+        baseViewportHeightRef.current = currentHeight;
+      }
+      const diff = baseViewportHeightRef.current - currentHeight;
+      const open = diff > 110;
+      setIsKeyboardOpen(open);
+      if (!open) {
+        setIsChatSessionActive(false);
+      }
+    };
+    vv?.addEventListener("resize", checkWebKeyboard);
+    window.addEventListener("resize", checkWebKeyboard);
+    return () => {
+      vv?.removeEventListener("resize", checkWebKeyboard);
+      window.removeEventListener("resize", checkWebKeyboard);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (activeTab !== "chat" || isChangeMediaOpen) {
+      setIsChatSessionActive(false);
+    }
+  }, [activeTab, isChangeMediaOpen]);
+
+  const handleChatInputFocusChange = useCallback((focused: boolean) => {
+    if (focused) {
+      if (typeof window !== "undefined" && !isKeyboardOpenRef.current) {
+        baseViewportHeightRef.current = Math.max(
+          baseViewportHeightRef.current,
+          window.innerHeight
+        );
+      }
+      setIsChatSessionActive(true);
+    } else if (!isKeyboardOpenRef.current) {
+      setIsChatSessionActive(false);
+    }
+  }, []);
 
   // Throttled sync updates
   const lastSyncWriteTime = useRef<number>(0);
@@ -650,6 +751,36 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
     }
   };
 
+  const isOfflineSource = room?.movieSource === "offline";
+  const isMobileKeyboardCompact = Boolean(
+    room &&
+      isSmallViewport &&
+      !isFullscreenActive &&
+      !isChangeMediaOpen &&
+      activeTab === "chat" &&
+      !room.movieCompleted &&
+      !(isOfflineSource && !localVideoUrl) &&
+      isKeyboardOpen &&
+      isChatSessionActive
+  );
+
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    if (isMobileKeyboardCompact) {
+      document.documentElement.dataset.watchKeyboardOpen = "true";
+      requestAnimationFrame(() => {
+        const rootEl = document.getElementById("root");
+        if (rootEl) rootEl.scrollTop = 0;
+        window.scrollTo(0, 0);
+      });
+    } else {
+      delete document.documentElement.dataset.watchKeyboardOpen;
+    }
+    return () => {
+      delete document.documentElement.dataset.watchKeyboardOpen;
+    };
+  }, [isMobileKeyboardCompact]);
+
   if (loading) {
     return (
       <div className="flex flex-col items-center justify-center min-h-[70vh] text-center p-6">
@@ -679,14 +810,25 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
     );
   }
 
-  const isOfflineSource = room.movieSource === "offline";
   const participantsList = room.participants ? Object.values(room.participants) : [];
   const activeParticipantsCount = participantsList.filter((p) => p.isOnline).length;
 
   return (
-    <div className="w-full max-w-7xl mx-auto px-3 sm:px-6 py-4 space-y-4 overflow-x-clip">
+    <div
+      className={
+        isMobileKeyboardCompact
+          ? "w-full h-full flex-1 min-h-0 max-w-7xl mx-auto px-2 py-1.5 flex flex-col gap-2 overflow-hidden"
+          : "w-full max-w-7xl mx-auto px-3 sm:px-6 py-4 space-y-4 overflow-x-clip"
+      }
+    >
       {/* Top Navigation & Status Bar - Normal scrolling element */}
-      <div className="flex flex-wrap items-center justify-between gap-3 p-3 bg-neutral-900/90 border border-neutral-800 rounded-2xl backdrop-blur-md shadow-xl">
+      <div
+        className={
+          isMobileKeyboardCompact
+            ? "hidden"
+            : "flex flex-wrap items-center justify-between gap-3 p-3 bg-neutral-900/90 border border-neutral-800 rounded-2xl backdrop-blur-md shadow-xl"
+        }
+      >
         <div className="flex items-center gap-3">
           <button
             onClick={handleExplicitLeaveRoom}
@@ -887,12 +1029,28 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
       )}
 
       {/* Main Watch Room Grid: Video Player (Left) + Chat / Participants (Right) */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
+      <div
+        className={
+          isMobileKeyboardCompact
+            ? "flex-1 min-h-0 flex flex-col gap-2"
+            : "grid grid-cols-1 lg:grid-cols-12 gap-4 items-start"
+        }
+      >
         {/* Video Player Column */}
-        <div className="w-full lg:col-span-8 space-y-3 sm:space-y-4">
+        <div
+          className={
+            isMobileKeyboardCompact
+              ? "w-full shrink-0"
+              : "w-full lg:col-span-8 space-y-3 sm:space-y-4"
+          }
+        >
           {/* Sticky Video Player Container - Pinned safely below status bar once scrolled */}
           <div
-            className={`sticky sticky-safe-top z-[9999] ${isOfflineSource ? "bg-transparent" : "bg-neutral-950/95"} py-1.5 sm:py-2 rounded-2xl watch-room-sticky-player`}
+            className={
+              isMobileKeyboardCompact
+                ? `w-full ${isOfflineSource ? "bg-transparent" : "bg-neutral-950"} rounded-xl overflow-hidden`
+                : `sticky sticky-safe-top z-[9999] ${isOfflineSource ? "bg-transparent" : "bg-neutral-950/95"} py-1.5 sm:py-2 rounded-2xl watch-room-sticky-player`
+            }
             style={{
               zIndex: 9999
             }}
@@ -934,7 +1092,13 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
           </div>
 
           {/* Room Details Accordion / Info Card */}
-          <div className="p-4 bg-neutral-900/80 border border-neutral-800 rounded-2xl backdrop-blur-sm flex flex-wrap items-center justify-between gap-3 text-xs">
+          <div
+            className={
+              isMobileKeyboardCompact
+                ? "hidden"
+                : "p-4 bg-neutral-900/80 border border-neutral-800 rounded-2xl backdrop-blur-sm flex flex-wrap items-center justify-between gap-3 text-xs"
+            }
+          >
             <div className="flex items-center gap-3">
               <div className="w-8 h-8 rounded-xl bg-neutral-800 flex items-center justify-center text-rose-500 font-bold">
                 <Film className="w-4 h-4" />
@@ -971,9 +1135,21 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
         </div>
 
         {/* Chat & Participants Column */}
-        <div className="w-full lg:col-span-4 flex flex-col h-[460px] sm:h-[520px] lg:h-[550px] lg:max-h-[70vh] min-h-[360px] sm:min-h-[480px]">
+        <div
+          className={
+            isMobileKeyboardCompact
+              ? "w-full flex-1 min-h-0 flex flex-col"
+              : "w-full lg:col-span-4 flex flex-col h-[460px] sm:h-[520px] lg:h-[550px] lg:max-h-[70vh] min-h-[360px] sm:min-h-[480px]"
+          }
+        >
           {/* Tabs for Mobile/Desktop */}
-          <div className="flex items-center gap-1 p-1 bg-neutral-950 rounded-xl border border-neutral-800 mb-2">
+          <div
+            className={
+              isMobileKeyboardCompact
+                ? "hidden"
+                : "flex items-center gap-1 p-1 bg-neutral-950 rounded-xl border border-neutral-800 mb-2"
+            }
+          >
             <button
               onClick={() => setActiveTab("chat")}
               className={`flex-1 py-1.5 text-xs font-semibold rounded-lg transition ${
@@ -1006,6 +1182,8 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
                 roomCode={roomCode}
                 adminUid={room.adminUid}
                 isMovieCompleted={room.movieCompleted}
+                isCompactKeyboard={isMobileKeyboardCompact}
+                onInputFocusChange={handleChatInputFocusChange}
               />
             ) : (
               <div className="h-full bg-neutral-900/90 border border-neutral-800 rounded-2xl p-4 overflow-y-auto">

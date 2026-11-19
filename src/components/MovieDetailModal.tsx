@@ -97,11 +97,11 @@ export function MovieDetailModal({
   const youtubeEmbedUrl = getYouTubeEmbedUrl(movie.trailer);
 
   return (
-    <div className="fixed inset-0 z-[20000] flex items-center justify-center p-3 sm:p-6 bg-black/90 backdrop-blur-md overflow-y-auto">
-      <div className="w-full max-w-3xl bg-neutral-900 border border-neutral-800 rounded-3xl overflow-hidden shadow-2xl relative my-auto">
+    <div className="fixed inset-0 z-[20000] flex items-center justify-center p-3 sm:p-6 bg-black/90 overflow-y-auto overscroll-contain">
+      <div className="w-full max-w-3xl max-h-[92dvh] overflow-y-auto overscroll-contain bg-neutral-900 border border-neutral-800 rounded-3xl shadow-2xl relative my-auto">
         <button
           onClick={onClose}
-          className="absolute top-4 right-4 z-30 p-2.5 bg-black/60 hover:bg-black/90 text-neutral-300 hover:text-white rounded-full backdrop-blur-md transition shadow-md"
+          className="absolute top-4 right-4 z-30 p-2.5 bg-black/75 hover:bg-black/95 text-neutral-300 hover:text-white rounded-full transition shadow-md"
           aria-label="Close"
         >
           <X className="w-5 h-5" />
@@ -151,20 +151,20 @@ export function MovieDetailModal({
               {/* Title & Badges positioned at bottom of backdrop */}
               <div className="absolute bottom-6 left-6 right-6 space-y-2">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-neutral-950/80 backdrop-blur-md text-neutral-200 border border-neutral-700">
+                  <span className="flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-neutral-950/90 text-neutral-200 border border-neutral-700">
                     <Calendar className="w-3.5 h-3.5 text-neutral-400" />
                     {movie.year}
                   </span>
                   {genres.map((g) => (
                     <span
                       key={g}
-                      className="px-2.5 py-0.5 rounded-full text-xs font-medium bg-rose-500/20 backdrop-blur-md text-rose-300 border border-rose-500/30"
+                      className="px-2.5 py-0.5 rounded-full text-xs font-medium bg-rose-500/20 text-rose-300 border border-rose-500/30"
                     >
                       {g}
                     </span>
                   ))}
                   {movie.subtitle && (
-                    <span className="flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-neutral-900/80 backdrop-blur-md text-emerald-300 border border-emerald-500/30">
+                    <span className="flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-neutral-900/90 text-emerald-300 border border-emerald-500/30">
                       <Subtitles className="w-3 h-3 text-emerald-400" />
                       CC Available
                     </span>

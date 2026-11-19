@@ -1,4 +1,5 @@
 import type { CapacitorConfig } from '@capacitor/cli';
+import { KeyboardResize, KeyboardStyle } from '@capacitor/keyboard';
 
 const config: CapacitorConfig = {
   appId: 'com.muvidate.app',
@@ -24,8 +25,8 @@ const config: CapacitorConfig = {
       showSpinner: false,
     },
     Keyboard: {
-      resize: 'body',
-      style: 'DARK',
+      resize: KeyboardResize.Native,
+      style: KeyboardStyle.Dark,
     },
     StatusBar: {
       style: 'DARK',
