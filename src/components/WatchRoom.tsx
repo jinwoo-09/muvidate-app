@@ -118,7 +118,7 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
   useEffect(() => {
     if (isNativeAndroid()) {
       return subscribeToKeyboardState(({ isOpen }) => {
-        setIsKeyboardOpen(isOpen);
+        setIsKeyboardOpen((prev) => (prev !== isOpen ? isOpen : prev));
         if (!isOpen) {
           setIsChatSessionActive(false);
         }
@@ -134,7 +134,7 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
       }
       const diff = baseViewportHeightRef.current - currentHeight;
       const open = diff > 110;
-      setIsKeyboardOpen(open);
+      setIsKeyboardOpen((prev) => (prev !== open ? open : prev));
       if (!open) {
         setIsChatSessionActive(false);
       }

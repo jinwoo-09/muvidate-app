@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { useAuth } from "../context/AuthContext";
 import { rtdb, getUserProfile } from "../lib/firebase";
 import { ref, onValue, off, push, set, update } from "firebase/database";
@@ -18,6 +18,67 @@ interface RoomChatProps {
   onInputFocusChange?: (focused: boolean) => void;
 }
 
+interface ChatInputBoxProps {
+  onSendMessage: (text: string) => Promise<void>;
+  isMovieCompleted: boolean;
+  onFocus?: () => void;
+  onBlur?: () => void;
+  inputRef?: React.RefObject<HTMLInputElement | null>;
+}
+
+const ChatInputBox = React.memo(function ChatInputBox({
+  onSendMessage,
+  isMovieCompleted,
+  onFocus,
+  onBlur,
+  inputRef
+}: ChatInputBoxProps) {
+  const [text, setText] = useState("");
+  const [sending, setSending] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const trimmed = text.trim();
+    if (!trimmed || sending || isMovieCompleted) return;
+
+    setSending(true);
+    try {
+      await onSendMessage(trimmed);
+      setText("");
+    } catch (err) {
+      console.error("Send error:", err);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <form onSubmit={handleSubmit} action="#" className="flex items-center gap-2">
+      <input
+        ref={inputRef}
+        type="text"
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onFocus={onFocus}
+        onBlur={onBlur}
+        placeholder="Type a message..."
+        disabled={isMovieCompleted}
+        className="flex-1 px-3 py-2 bg-neutral-900 border border-neutral-750 rounded-xl text-base sm:text-xs text-white placeholder-neutral-500 focus:outline-none focus:ring-1 focus:ring-rose-500 transition"
+      />
+      <button
+        type="submit"
+        onMouseDown={(e) => e.preventDefault()}
+        disabled={!text.trim() || sending || isMovieCompleted}
+        className="p-2.5 bg-rose-600 hover:bg-rose-500 text-white rounded-xl transition disabled:opacity-40 shadow-sm shrink-0"
+        title="Send message"
+      >
+        <Send className="w-4 h-4" />
+      </button>
+    </form>
+  );
+});
+
 export function RoomChat({ 
   roomCode, 
   adminUid, 
@@ -27,8 +88,6 @@ export function RoomChat({
 }: RoomChatProps) {
   const { user, profile } = useAuth();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [inputText, setInputText] = useState("");
-  const [isSending, setIsSending] = useState(false);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const chatInputRef = useRef<HTMLInputElement>(null);
   const [keyboardOffset, setKeyboardOffset] = useState(0);
@@ -153,7 +212,7 @@ export function RoomChat({
     };
   }, [isCompactKeyboard]);
 
-  const handleInputFocus = () => {
+  const handleInputFocus = useCallback(() => {
     onInputFocusChange?.(true);
     requestAnimationFrame(() => {
       if (messagesContainerRef.current) {
@@ -165,47 +224,36 @@ export function RoomChat({
         messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
       }
     }, 180);
-  };
+  }, [onInputFocusChange]);
 
-  const handleInputBlur = () => {
+  const handleInputBlur = useCallback(() => {
     onInputFocusChange?.(false);
-  };
+  }, [onInputFocusChange]);
 
-  const handleSendMessage = async (e: React.FormEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    const text = inputText.trim();
-    if (!text || !user || !profile || isSending || isMovieCompleted) return;
+  const handleSendMessage = useCallback(async (text: string) => {
+    if (!text || !user || !profile || isMovieCompleted) return;
 
-    setIsSending(true);
-    try {
-      const chatRef = ref(rtdb, `rooms/${roomCode}/chat`);
-      const newMsgRef = push(chatRef);
-      const photoURL = profile.photoURL || avatarMemoryCache.get(user.uid) || "";
-      const msg: ChatMessage = {
-        id: newMsgRef.key || Date.now().toString(),
-        uid: user.uid,
-        username: profile.username,
-        photoURL,
-        type: "text",
-        text,
-        createdAt: Date.now()
-      };
-      await set(newMsgRef, msg);
-      setInputText("");
+    const chatRef = ref(rtdb, `rooms/${roomCode}/chat`);
+    const newMsgRef = push(chatRef);
+    const photoURL = profile.photoURL || avatarMemoryCache.get(user.uid) || "";
+    const msg: ChatMessage = {
+      id: newMsgRef.key || Date.now().toString(),
+      uid: user.uid,
+      username: profile.username,
+      photoURL,
+      type: "text",
+      text,
+      createdAt: Date.now()
+    };
+    await set(newMsgRef, msg);
 
-      // Ensure user presence is active in the room upon sending message
-      const participantRef = ref(rtdb, `rooms/${roomCode}/participants/${user.uid}`);
-      update(participantRef, {
-        isOnline: true,
-        lastActive: Date.now()
-      }).catch(() => {});
-    } catch (err) {
-      console.error("Send message error:", err);
-    } finally {
-      setIsSending(false);
-    }
-  };
+    // Ensure user presence is active in the room upon sending message
+    const participantRef = ref(rtdb, `rooms/${roomCode}/participants/${user.uid}`);
+    update(participantRef, {
+      isOnline: true,
+      lastActive: Date.now()
+    }).catch(() => {});
+  }, [user, profile, roomCode, isMovieCompleted]);
 
   const formatTime = (timestamp?: number) => {
     if (!timestamp) return "";
@@ -360,34 +408,13 @@ export function RoomChat({
             Chat is disabled (movie session ended).
           </p>
         ) : (
-          <form 
-            onSubmit={handleSendMessage} 
-            action="#" 
-            className="flex items-center gap-2"
-          >
-
-            <input
-              ref={chatInputRef}
-              type="text"
-              value={inputText}
-              onChange={(e) => setInputText(e.target.value)}
-              onFocus={handleInputFocus}
-              onBlur={handleInputBlur}
-              placeholder="Type a message..."
-              disabled={isMovieCompleted}
-              className="flex-1 px-3 py-2 bg-neutral-900 border border-neutral-750 rounded-xl text-base sm:text-xs text-white placeholder-neutral-500 focus:outline-none focus:ring-1 focus:ring-rose-500 transition"
-            />
-
-            <button
-              type="submit"
-              onMouseDown={(e) => e.preventDefault()}
-              disabled={!inputText.trim() || isSending || isMovieCompleted}
-              className="p-2.5 bg-rose-600 hover:bg-rose-500 text-white rounded-xl transition disabled:opacity-40 shadow-sm shrink-0"
-              title="Send message"
-            >
-              <Send className="w-4 h-4" />
-            </button>
-          </form>
+          <ChatInputBox
+            onSendMessage={handleSendMessage}
+            isMovieCompleted={isMovieCompleted}
+            onFocus={handleInputFocus}
+            onBlur={handleInputBlur}
+            inputRef={chatInputRef}
+          />
         )}
       </div>
 
